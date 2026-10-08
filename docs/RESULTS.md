@@ -87,6 +87,9 @@ during decode.
 - **4 experts instead of 6**: +4% decode. Rejected as a quality risk.
 - **UD-Q2_K_XL**: +2% decode, +6-10% prefill, 10 GB smaller. Its experts are still i-quants. Quality was not measured,
   so UD-IQ3_XXS stays the reference.
+- **ROCm 10.1** (HIP 7.16, clang 24; `container/Containerfile.rocm10`, 2026-10-08): all op tests pass, but decode is
+  unchanged (23.2 vs 23.4 tok/s at 0, 18.7 vs 18.5 at 4K) and prefill is 2–3% slower. HIP graphs are still slower
+  than plain launches. The ~6 µs per-launch cost doesn't come from the user-space runtime.
 - **MTP drafting more than 1 token**: depths ≥ 1 agree with the target ~2% of the time.
 
 ## Where decode time goes now

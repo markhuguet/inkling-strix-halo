@@ -1,0 +1,25 @@
+# Dev image for llama.cpp on Strix Halo (gfx1151) with ROCm 10.x from AMD's stable RHEL 10 RPM repo
+# (new TheRock layout: everything under /opt/rocm/core-<ver>, linked to /opt/rocm/* like kyuz0's rocm-10.0 toolbox).
+FROM registry.fedoraproject.org/fedora:44
+
+ARG ROCM_VER=10.1
+RUN dnf -y --nodocs --setopt=install_weak_deps=False install \
+      make gcc gcc-c++ cmake ninja-build lld git patch curl tar xz python3 python3-pip procps-ng \
+      python3-numpy python3-pyyaml python3-tqdm \
+  && printf '[amdrocm-stable]\nname=ROCm\nbaseurl=https://stable.repo.amd.com/rocm/core/packages/rhel10/x86_64\ngpgcheck=1\ngpgkey=https://stable.repo.amd.com/rocm/gpg/packages.gpg\nenabled=1\n' > /etc/yum.repos.d/rocm.repo \
+  && dnf -y --nodocs --setopt=install_weak_deps=False install \
+      amdrocm-core-sdk${ROCM_VER}-gfx1151 amdrocm-blas${ROCM_VER}-gfx1151 amdrocm-blas-devel${ROCM_VER} \
+      amdrocm-profiler${ROCM_VER} \
+  && dnf clean all && rm -rf /var/cache/dnf/* \
+  && for d in bin include lib libexec share; do ln -sfn core-${ROCM_VER}/$d /opt/rocm/$d; done \
+  && ln -sfn core-${ROCM_VER} /opt/rocm/core && ln -sfn core-${ROCM_VER}/lib/llvm /opt/rocm/llvm \
+  && echo /opt/rocm/core/lib > /etc/ld.so.conf.d/rocm.conf && echo /opt/rocm/core/lib/rocm_sysdeps/lib >> /etc/ld.so.conf.d/rocm.conf && ldconfig
+
+ENV ROCM_PATH=/opt/rocm \
+    HIP_PATH=/opt/rocm \
+    HIP_PLATFORM=amd \
+    PATH=/opt/rocm/bin:/opt/rocm/llvm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    LD_LIBRARY_PATH=/opt/rocm/core/lib:/opt/rocm/core/lib/rocm_sysdeps/lib \
+    CMAKE_PREFIX_PATH=/opt/rocm
+
+WORKDIR /src
