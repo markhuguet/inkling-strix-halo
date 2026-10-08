@@ -1,0 +1,666 @@
+From e8404bf57ff7b40fb95a09275dedf9b913306747 Mon Sep 17 00:00:00 2001
+From: mark <30506876+markhuguet@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 20:31:47 -0400
+Subject: [PATCH 15/15] inkling: MTP depth heads + short-conv state rollback
+
+- load the 8 MTP depth layers (blk.n_layer.., nextn.eh_proj/enorm/hnorm, dense FFN)
+  and build the MTP graph: eh_proj(cat[hnorm(h) | enorm(tok_norm(embd(x)))]) -> decoder layer,
+  shared LM head, no final norm; target exports post-final-norm hidden as h_nextn
+- recurrent memory sized over n_layer_all; hybrid memories filter MTP / backbone layers by ctx type
+- short-conv rollback snapshots (n_rs_seq) in build_sconv; Inkling joins llm_arch_supports_rs_rollback
+- llama_memory_seq_rewind_nextn: position-only rewind used by the MTP chain-heads catch-up and draft
+- MTP draft context gets the target's n_rs_seq so common_memory::seq_rm can roll both back
+- tools/inkling-mtp-check: teacher-forced per-depth MTP accuracy check
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/speculative.cpp                |  14 ++-
+ src/llama-arch.cpp                    |   1 +
+ src/llama-context.cpp                 |   7 ++
+ src/llama-ext.h                       |   3 +
+ src/llama-memory-hybrid-iswa.cpp      |   4 +
+ src/llama-memory-hybrid-iswa.h        |   1 +
+ src/llama-memory-hybrid.cpp           |   4 +
+ src/llama-memory-hybrid.h             |   1 +
+ src/llama-memory-recurrent.cpp        |  25 +++-
+ src/llama-memory-recurrent.h          |   1 +
+ src/llama-memory.h                    |   5 +
+ src/llama-model.cpp                   |   8 +-
+ src/models/inkling.cpp                | 163 ++++++++++++++++++++------
+ tools/inkling-mtp-check/mtp-check.cpp | 112 ++++++++++++++++++
+ 14 files changed, 302 insertions(+), 47 deletions(-)
+ create mode 100644 tools/inkling-mtp-check/mtp-check.cpp
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 77dfe9535..e7000803d 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1549,14 +1549,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             auto * mem_dft = llama_get_memory(ctx_dft);
+ 
+             bool ok = true;
+-            for (int head = 0; head < n_mtp_layers; ++head) {
++            // chained heads beyond n_max never draft: only catch up the heads that can be used
++            const int n_heads_catchup = chain_heads ? std::min(n_mtp_layers, std::max(1, this->params.n_max)) : n_mtp_layers;
++            for (int head = 0; head < n_heads_catchup; ++head) {
+                 if (chain_heads) {
+                     // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
+                     for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                         if (i_batch_beg[seq_id] < 0) {
+                             continue;
+                         }
+-                        llama_memory_seq_rm(mem_dft, seq_id, batch_in.pos[i_batch_beg[seq_id]], -1);
++                        // position-only rewind for recurrent state: each head writes only its own layers
++                        llama_memory_seq_rewind_nextn(mem_dft, seq_id, batch_in.pos[i_batch_beg[seq_id]]);
+                     }
+                     llama_set_nextn_layer_offset(ctx_dft, head);
+                 }
+@@ -1644,7 +1647,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 auto * mem_dft = llama_get_memory(ctx_dft);
+                 for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                     if (drafting[seq_id]) {
+-                        llama_memory_seq_rm(mem_dft, seq_id, dparams[seq_id].pos0, -1);
++                        // head i's own layers are still at pos0 - 1: a position-only rewind suffices for recurrent state
++                        llama_memory_seq_rewind_nextn(mem_dft, seq_id, dparams[seq_id].pos0);
+                     }
+                 }
+                 llama_set_nextn_layer_offset(ctx_dft, i);
+@@ -2551,7 +2555,9 @@ common_speculative_init_result::common_speculative_init_result(
+ 
+     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
+     //       the extra memory for small models is likely negligible?
+-    cparams.n_rs_seq  = 0;
++    // an MTP draft context is rolled back together with the target (common_memory::seq_rm), so it needs the same
++    // recurrent-state rollback depth
++    cparams.n_rs_seq  = spec_mtp ? llama_n_rs_seq(ctx_tgt) : 0;
+     cparams.ctx_other = ctx_tgt;
+ 
+     std::string model_path;
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index 43e4dd832..50d34f557 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -1155,6 +1155,7 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
+         case LLM_ARCH_LFM2:
+         case LLM_ARCH_LFM2MOE:
+         case LLM_ARCH_BAILINGMOE3:
++        case LLM_ARCH_INKLING:
+             return true;
+         default:
+             return false;
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index ec7582a31..ae9359f3b 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3986,6 +3986,13 @@ void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
+     ctx->set_nextn_layer_offset(offset);
+ }
+ 
++bool llama_memory_seq_rewind_nextn(llama_memory_t mem, llama_seq_id seq_id, llama_pos p0) {
++    if (!mem) {
++        return true;
++    }
++    return mem->seq_rewind_nextn(seq_id, p0);
++}
++
+ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
+     if (!ctx) {
+         return nullptr;
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index 92a759b7a..50c1528f1 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -100,6 +100,9 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
+ // chain multiple trained NextN heads. Default 0 (first head).
+ LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
+ 
++// MTP chain-heads catch-up rewind (see llama_memory_i::seq_rewind_nextn)
++LLAMA_API bool llama_memory_seq_rewind_nextn(llama_memory_t mem, llama_seq_id seq_id, llama_pos p0);
++
+ // mirrors:
+ // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
+ LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
+diff --git a/src/llama-memory-hybrid-iswa.cpp b/src/llama-memory-hybrid-iswa.cpp
+index 06f7fd542..4ae5c7875 100644
+--- a/src/llama-memory-hybrid-iswa.cpp
++++ b/src/llama-memory-hybrid-iswa.cpp
+@@ -145,6 +145,10 @@ void llama_memory_hybrid_iswa::clear(bool data) {
+     mem_recr->clear(data);
+ }
+ 
++bool llama_memory_hybrid_iswa::seq_rewind_nextn(llama_seq_id seq_id, llama_pos p0) {
++    return mem_recr->seq_rewind_nextn(seq_id, p0) && mem_attn->seq_rm(seq_id, p0, -1);
++}
++
+ bool llama_memory_hybrid_iswa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+     // Try removing from the recurrent cache first since it may fail. If it does
+     // fail, the cache will not have been mutated.
+diff --git a/src/llama-memory-hybrid-iswa.h b/src/llama-memory-hybrid-iswa.h
+index c9d3f9f57..ce3c31c23 100644
+--- a/src/llama-memory-hybrid-iswa.h
++++ b/src/llama-memory-hybrid-iswa.h
+@@ -61,6 +61,7 @@ public:
+     void clear(bool data) override;
+ 
+     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
++    bool seq_rewind_nextn(llama_seq_id seq_id, llama_pos p0) override;
+     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+     void seq_keep(llama_seq_id seq_id)                                                          override;
+     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
+diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
+index 42c7381a9..d2ce703f2 100644
+--- a/src/llama-memory-hybrid.cpp
++++ b/src/llama-memory-hybrid.cpp
+@@ -140,6 +140,10 @@ void llama_memory_hybrid::clear(bool data) {
+     mem_recr->clear(data);
+ }
+ 
++bool llama_memory_hybrid::seq_rewind_nextn(llama_seq_id seq_id, llama_pos p0) {
++    return mem_recr->seq_rewind_nextn(seq_id, p0) && mem_attn->seq_rm(seq_id, p0, -1);
++}
++
+ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+     // Try removing from the recurrent cache first since it may fail. If it does
+     // fail, the cache will not have been mutated.
+diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
+index 484eafb74..7b90a28fe 100644
+--- a/src/llama-memory-hybrid.h
++++ b/src/llama-memory-hybrid.h
+@@ -61,6 +61,7 @@ public:
+     void clear(bool data) override;
+ 
+     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
++    bool seq_rewind_nextn(llama_seq_id seq_id, llama_pos p0) override;
+     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+     void seq_keep(llama_seq_id seq_id)                                                          override;
+     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index 57919accf..3427d239d 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -26,7 +26,9 @@ llama_memory_recurrent::llama_memory_recurrent(
+                  uint32_t   n_seq_max,
+                  uint32_t   n_rs_seq,
+     const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max) {
+-    const int32_t n_layer = hparams.n_layer();
++    // n_layer_all: MTP/NextN blocks (il >= n_layer()) can carry recurrent state too (e.g. Inkling's MTP depths in an
++    // MTP context); the filter decides which layers get tensors. Equal to n_layer() for models without such blocks.
++    const int32_t n_layer = hparams.n_layer_all;
+ 
+     head = 0;
+     size = mem_size;
+@@ -158,6 +160,21 @@ void llama_memory_recurrent::clear(bool data) {
+     std::fill(rs_idx.begin(), rs_idx.end(), 0);
+ }
+ 
++bool llama_memory_recurrent::seq_rewind_nextn(llama_seq_id seq_id, llama_pos p0) {
++    if (seq_id < 0 || (uint32_t) seq_id >= size || p0 <= 0) {
++        return seq_rm(seq_id, p0, -1);
++    }
++    const int32_t tail_id = cells[seq_id].tail;
++    if (tail_id < 0) {
++        return true;
++    }
++    auto & cell = cells[tail_id];
++    if (p0 <= cell.pos) {
++        cell.pos = p0 - 1; // position only: see llama_memory_i::seq_rewind_nextn
++    }
++    return true;
++}
++
+ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+     uint32_t new_head = size;
+ 
+@@ -896,7 +913,7 @@ void llama_memory_recurrent::state_write_meta(llama_io_write_i & io, const std::
+ 
+ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const {
+     const uint32_t s_trans = 0;
+-    const uint32_t n_layer = hparams.n_layer();
++    const uint32_t n_layer = hparams.n_layer_all;
+ 
+     io.write(&s_trans, sizeof(s_trans));
+     io.write(&n_layer, sizeof(n_layer));
+@@ -1091,8 +1108,8 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
+     io.read(&s_trans, sizeof(s_trans));
+     io.read(&n_layer, sizeof(n_layer));
+ 
+-    if (n_layer != hparams.n_layer()) {
+-        LLAMA_LOG_ERROR("%s: mismatched layer count (%u instead of %u)\n", __func__, n_layer, hparams.n_layer());
++    if (n_layer != hparams.n_layer_all) {
++        LLAMA_LOG_ERROR("%s: mismatched layer count (%u instead of %u)\n", __func__, n_layer, hparams.n_layer_all);
+         return false;
+     }
+     if (cell_count > size) {
+diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
+index 4abb3f5cf..40bfcee99 100644
+--- a/src/llama-memory-recurrent.h
++++ b/src/llama-memory-recurrent.h
+@@ -44,6 +44,7 @@ public:
+     void clear(bool data) override;
+ 
+     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
++    bool seq_rewind_nextn(llama_seq_id seq_id, llama_pos p0) override;
+     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+     void seq_keep(llama_seq_id seq_id)                                                          override;
+     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
+diff --git a/src/llama-memory.h b/src/llama-memory.h
+index db8253966..239b7fb6b 100644
+--- a/src/llama-memory.h
++++ b/src/llama-memory.h
+@@ -108,6 +108,11 @@ struct llama_memory_i {
+     virtual void clear(bool data) = 0;
+ 
+     virtual bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) = 0;
++
++    // MTP chain-heads catch-up: drop positions >= p0 so the next head can re-decode them. Each head writes only its
++    // own layers, so a recurrent state may just rewind its position (its data for the next head's layers is still at
++    // p0 - 1). Not a general rollback. Defaults to seq_rm.
++    virtual bool seq_rewind_nextn(llama_seq_id seq_id, llama_pos p0) { return seq_rm(seq_id, p0, -1); }
+     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
+     virtual void seq_keep(llama_seq_id seq_id) = 0;
+     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index fb157d9cd..cb82bd72e 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2565,7 +2565,13 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                     // a null filter_idx means the GGUF has no indexer tensors
+                     llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
+                     const bool needs_mem_idx = (arch == LLM_ARCH_QWEN4EXP);
+-                    if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING) {
++                    if (arch == LLM_ARCH_INKLING) {
++                        // every block has an attention KV cache and a recurrent (conv) state; the main context holds
++                        // the backbone blocks, an MTP context only the MTP depth blocks (blk.{n_layer + d})
++                        const bool mtp_ctx = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hparams.n_layer_nextn > 0;
++                        filter_attn = [&, mtp_ctx](uint32_t il) { return mtp_ctx ? il >= hparams.n_layer() : il < hparams.n_layer(); };
++                        filter_recr = filter_attn;
++                    } else if (arch == LLM_ARCH_FALCON_H1) {
+                         // all layers have both an attention KV cache and a recurrent (conv) state
+                         filter_attn = [&](uint32_t) { return true; };
+                         filter_recr = [&](uint32_t) { return true; };
+diff --git a/src/models/inkling.cpp b/src/models/inkling.cpp
+index cb6cf1cfd..f9e7c1c1e 100644
+--- a/src/models/inkling.cpp
++++ b/src/models/inkling.cpp
+@@ -19,9 +19,10 @@ void llama_model_inkling::load_arch_hparams(llama_model_loader & ml) {
+ 
+     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa);
+     hparams.swa_type = LLAMA_SWA_TYPE_STANDARD; // visible iff pos_q - pos_k < n_swa (includes self)
+-    ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer());
++    // n_layer_all includes the MTP depth blocks (blk.{n_layer + i}), which have their own SWA flag and conv state
++    ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.is_swa_impl, hparams.n_layer_all);
+ 
+-    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
++    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+         hparams.is_recr_impl[il] = 1;
+     }
+ 
+@@ -51,7 +52,7 @@ void llama_model_inkling::load_arch_hparams(llama_model_loader & ml) {
+     type = LLM_TYPE_UNKNOWN;
+ }
+ 
+-void llama_model_inkling::load_arch_tensors(llama_model_loader &) {
++void llama_model_inkling::load_arch_tensors(llama_model_loader & ml) {
+     LLAMA_LOAD_LOCALS;
+ 
+     const int64_t head_dim = hparams.n_embd_head_k();
+@@ -65,34 +66,63 @@ void llama_model_inkling::load_arch_tensors(llama_model_loader &) {
+     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,     "weight"), {n_embd}, 0);
+     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,          "weight"), {n_embd, n_vocab}, 0);
+ 
+-    for (int i = 0; i < n_layer; ++i) {
++    // attention + short convs + norms: identical for backbone layers and MTP depth blocks
++    auto load_block_common = [&](int i, int flags) {
+         auto & layer = layers[i];
+ 
+         const int64_t n_head_kv_i = hparams.n_head_kv(i);
+         const int64_t kvw         = n_head_kv_i * head_dim;
+         const int64_t rel_extent  = hparams.is_swa(i) ? hparams.inkling_rel_extent_swa : hparams.inkling_rel_extent;
+ 
+-        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
++        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, flags);
+ 
+-        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_head*head_dim}, 0);
+-        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, kvw}, 0);
+-        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, kvw}, 0);
+-        layer.wr = create_tensor(tn(LLM_TENSOR_ATTN_R,   "weight", i), {n_embd, n_head*d_rel}, 0);
+-        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_head*head_dim, n_embd}, 0);
++        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_head*head_dim}, flags);
++        layer.wk = create_tensor(tn(LLM_TENSOR_ATTN_K,   "weight", i), {n_embd, kvw}, flags);
++        layer.wv = create_tensor(tn(LLM_TENSOR_ATTN_V,   "weight", i), {n_embd, kvw}, flags);
++        layer.wr = create_tensor(tn(LLM_TENSOR_ATTN_R,   "weight", i), {n_embd, n_head*d_rel}, flags);
++        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_head*head_dim, n_embd}, flags);
+ 
+-        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {head_dim}, 0);
+-        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {head_dim}, 0);
++        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {head_dim}, flags);
++        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", i), {head_dim}, flags);
+ 
+         // stored in checkpoint orientation [d_rel, E] -> gguf ne = [E, d_rel]
+-        layer.attn_rel_proj = create_tensor(tn(LLM_TENSOR_ATTN_REL_PROJ, "weight", i), {rel_extent, d_rel}, 0);
++        layer.attn_rel_proj = create_tensor(tn(LLM_TENSOR_ATTN_REL_PROJ, "weight", i), {rel_extent, d_rel}, flags);
++
++        layer.shortconv_k    = create_tensor(tn(LLM_TENSOR_SHORTCONV_K,    "weight", i), {K, kvw}, flags);
++        layer.shortconv_v    = create_tensor(tn(LLM_TENSOR_SHORTCONV_V,    "weight", i), {K, kvw}, flags);
++        layer.shortconv_attn = create_tensor(tn(LLM_TENSOR_SHORTCONV_ATTN, "weight", i), {K, n_embd}, flags);
++        layer.shortconv_mlp  = create_tensor(tn(LLM_TENSOR_SHORTCONV_MLP,  "weight", i), {K, n_embd}, flags);
++
++        layer.ffn_norm   = create_tensor(tn(LLM_TENSOR_FFN_NORM,   "weight", i), {n_embd}, flags);
++        layer.ffn_gscale = create_tensor(tn(LLM_TENSOR_FFN_GSCALE, "weight", i), {1}, flags);
++    };
+ 
+-        layer.shortconv_k    = create_tensor(tn(LLM_TENSOR_SHORTCONV_K,    "weight", i), {K, kvw}, 0);
+-        layer.shortconv_v    = create_tensor(tn(LLM_TENSOR_SHORTCONV_V,    "weight", i), {K, kvw}, 0);
+-        layer.shortconv_attn = create_tensor(tn(LLM_TENSOR_SHORTCONV_ATTN, "weight", i), {K, n_embd}, 0);
+-        layer.shortconv_mlp  = create_tensor(tn(LLM_TENSOR_SHORTCONV_MLP,  "weight", i), {K, n_embd}, 0);
++    // MTP depth blocks (blk.{n_layer + d}): a full Inkling block with a dense MLP, plus nextn input fusion.
++    // Optional: a trunk-only GGUF (no blk.{n_layer}.nextn.eh_proj) still loads; skipped unless MTP is requested.
++    if (n_layer_nextn > 0) {
++        const std::string probe = "blk." + std::to_string(n_layer) + ".nextn.eh_proj.weight";
++        int mtp_flags = ml.get_weight(probe.c_str()) == nullptr ? TENSOR_NOT_REQUIRED : 0;
++        if (!ml.load_mtp) {
++            mtp_flags |= TENSOR_SKIP;
++        }
++        for (int i = n_layer; i < n_layer_all; ++i) {
++            auto & layer = layers[i];
++            load_block_common(i, mtp_flags);
++            const int64_t n_ff_i = hparams.n_ff(i);
++            layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd, n_ff_i}, mtp_flags);
++            layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd, n_ff_i}, mtp_flags);
++            layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff_i, n_embd}, mtp_flags);
++            // input fusion: [hidden_norm(h) | embed_norm(embd)] (2*n_embd) -> n_embd
++            layer.nextn.eh_proj = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", i), {2*n_embd, n_embd}, mtp_flags);
++            layer.nextn.enorm   = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,   "weight", i), {n_embd}, mtp_flags);
++            layer.nextn.hnorm   = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,   "weight", i), {n_embd}, mtp_flags);
++        }
++    }
++
++    for (int i = 0; i < n_layer; ++i) {
++        auto & layer = layers[i];
+ 
+-        layer.ffn_norm   = create_tensor(tn(LLM_TENSOR_FFN_NORM,   "weight", i), {n_embd}, 0);
+-        layer.ffn_gscale = create_tensor(tn(LLM_TENSOR_FFN_GSCALE, "weight", i), {1}, 0);
++        load_block_common(i, 0);
+ 
+         if (i < (int) hparams.n_layer_dense_lead) {
+             const int64_t n_ff_i = hparams.n_ff(i);
+@@ -229,6 +259,20 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+     const int64_t n_seqs       = ubatch.n_seqs;
+ 
++    // DECODER_MTP: run only MTP depth block n_layer + nextn_layer_offset (the speculative driver bumps the offset
++    // per draft step); otherwise the backbone layers.
++    const bool is_mtp = params.gtype == LLM_GRAPH_TYPE_DECODER_MTP;
++    std::vector<int> layer_ids;
++    if (is_mtp) {
++        GGML_ASSERT(hparams.n_layer_nextn > 0 && "Inkling MTP requires nextn_predict_layers > 0");
++        GGML_ASSERT(cparams.nextn_layer_offset >= 0 && cparams.nextn_layer_offset < (int) hparams.n_layer_nextn);
++        layer_ids.push_back((int) hparams.n_layer() + cparams.nextn_layer_offset);
++    } else {
++        for (int il = 0; il < (int) hparams.n_layer(); ++il) {
++            layer_ids.push_back(il);
++        }
++    }
++
+     GGML_ASSERT(n_seqs != 0);
+     GGML_ASSERT(ubatch.equal_seqs());
+     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
+@@ -272,7 +316,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+             banded_cache_type_supported(cache->type_v());
+     };
+ 
+-    for (int il = 0; il < n_layer; ++il) {
++    for (int il : layer_ids) {
+         if (hparams.is_swa(il)) {
+             needs_rel_idx_local |= !use_banded_flash(il);
+         } else {
+@@ -311,7 +355,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+     }
+ 
+     // shared experts go through mul_mat_id: 2D views into a repacked/quantized 3D bank are invalid
+-    if (hparams.n_expert_shared > 0 && (uint32_t) n_layer > hparams.n_layer_dense_lead) {
++    if (!is_mtp && hparams.n_expert_shared > 0 && (uint32_t) n_layer > hparams.n_layer_dense_lead) {
+         inp->shexp_idx = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, hparams.n_expert_shared, n_tokens);
+         ggml_set_input(inp->shexp_idx);
+         ggml_set_name(inp->shexp_idx, "inkling_shexp_idx");
+@@ -323,7 +367,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+     static const bool exact_kv = getenv("LLAMA_INKLING_PAD_KV") == nullptr;
+     bool any_banded_global = false;
+     bool any_banded_swa    = false;
+-    for (int il = 0; il < n_layer; ++il) {
++    for (int il : layer_ids) {
+         if (use_banded_flash(il)) {
+             (hparams.is_swa(il) ? any_banded_swa : any_banded_global) = true;
+         }
+@@ -373,12 +417,19 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+ 
+         ggml_tensor * sx = ggml_concat(ctx0, state, xt, 0); // {d_conv + n_seq_tokens, w, n_seqs}
+ 
+-        // write the last d_conv time columns back into the cache
+-        ggml_tensor * new_state = ggml_view_3d(ctx0, sx, d_conv, w, n_seqs,
+-                sx->nb[1], sx->nb[2], (sx->ne[0] - d_conv)*sx->nb[0]);
+-        ggml_tensor * state_dst = ggml_view_3d(ctx0, conv_state, d_conv, w, n_seqs,
+-                d_conv*sz, n_embd_r*sz, (kv_head*n_embd_r + off)*sz);
+-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, new_state, state_dst));
++        // write the last d_conv time columns back into the cache. With n_rs_seq > 0 (speculative decoding) also write
++        // snapshot slot s = the state s tokens back, so a partial rejection rolls back without a checkpoint replay
++        // (same layout as LFM2: slot block s holds mem_size cells).
++        const int64_t n_rs_slots = cparams.n_rs_seq > 0 ? (int64_t) cparams.n_rs_seq + 1 : 1;
++        const int64_t n_written  = std::min<int64_t>(n_seq_tokens, n_rs_slots);
++        const int64_t mem_size   = mctx_recr->get_size();
++        for (int64_t slot = 0; slot < n_written; ++slot) {
++            ggml_tensor * new_state = ggml_view_3d(ctx0, sx, d_conv, w, n_seqs,
++                    sx->nb[1], sx->nb[2], (sx->ne[0] - d_conv - slot)*sx->nb[0]);
++            ggml_tensor * state_dst = ggml_view_3d(ctx0, conv_state, d_conv, w, n_seqs,
++                    d_conv*sz, n_embd_r*sz, ((slot*mem_size + kv_head)*n_embd_r + off)*sz);
++            ggml_build_forward_expand(gf, ggml_cpy(ctx0, new_state, state_dst));
++        }
+ 
+         ggml_tensor * conv_out = ggml_ssm_conv(ctx0, sx, kernel); // {w, n_seq_tokens, n_seqs}
+ 
+@@ -673,18 +724,46 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+         return moe_out;
+     };
+ 
+-    ggml_tensor * cur = build_inp_embd(model.tok_embd);
+-    // mtmd embd rows arrive pre-normalized; embed_norm applies to text token lookups only
+-    if (ubatch.token) {
+-        cur = build_norm(cur, model.tok_norm, NULL, LLM_NORM_RMS, -1);
+-        cb(cur, "inkling_embd_norm", -1);
++    ggml_tensor * cur = nullptr;
++    if (is_mtp) {
++        const int il = layer_ids[0];
++        const auto & layer = model.layers[il];
++        GGML_ASSERT(layer.nextn.eh_proj && layer.nextn.enorm && layer.nextn.hnorm && "Inkling MTP block missing nextn tensors");
++
++        auto inp_mtp = std::make_unique<llm_graph_input_embd>(hparams.n_embd);
++        inp_mtp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
++        ggml_set_input(inp_mtp->tokens);
++        inp_mtp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd, n_tokens);
++        ggml_set_input(inp_mtp->embd);
++        ggml_set_name(inp_mtp->embd, "mtp_h_input");
++        ggml_tensor * h_in = inp_mtp->embd;
++        ggml_tensor * e_in = ggml_get_rows(ctx0, model.tok_embd, inp_mtp->tokens);
++        res->add_input(std::move(inp_mtp));
++
++        // the depth embed_norm was trained on backbone-normed embeddings: backbone embed_norm first
++        e_in = build_norm(e_in, model.tok_norm, NULL, LLM_NORM_RMS, -1);
++        ggml_tensor * e_norm = build_norm(e_in, layer.nextn.enorm, NULL, LLM_NORM_RMS, il);
++        ggml_tensor * h_norm = build_norm(h_in, layer.nextn.hnorm, NULL, LLM_NORM_RMS, il);
++        cb(e_norm, "mtp_enorm", il);
++        cb(h_norm, "mtp_hnorm", il);
++
++        // input_proj columns are [hidden | embed]
++        cur = build_lora_mm(layer.nextn.eh_proj, ggml_concat(ctx0, h_norm, e_norm, 0));
++        cb(cur, "mtp_eh_proj", il);
+     } else {
+-        cb(cur, "inkling_mm_embd", -1);
++        cur = build_inp_embd(model.tok_embd);
++        // mtmd embd rows arrive pre-normalized; embed_norm applies to text token lookups only
++        if (ubatch.token) {
++            cur = build_norm(cur, model.tok_norm, NULL, LLM_NORM_RMS, -1);
++            cb(cur, "inkling_embd_norm", -1);
++        } else {
++            cb(cur, "inkling_mm_embd", -1);
++        }
+     }
+ 
+     ggml_build_forward_expand(gf, cur);
+ 
+-    for (int il = 0; il < n_layer; ++il) {
++    for (int il : layer_ids) {
+         conv_rs_cur = build_rs(inp_hybrid->get_recr(), mctx_recr->get_r_l(il), n_embd_r, n_seqs);
+ 
+         // h += attn_sconv(attn(attn_norm(h)))
+@@ -699,7 +778,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+         // h += mlp_sconv(mlp(mlp_norm(h)))
+         ggml_tensor * ffn_in  = build_norm(cur, model.layers[il].ffn_norm, NULL, LLM_NORM_RMS, il);
+         cb(ffn_in, "inkling_ffn_norm", il);
+-        ggml_tensor * ffn_out = il < (int) hparams.n_layer_dense_lead ?
++        ggml_tensor * ffn_out = (il < (int) hparams.n_layer_dense_lead || il >= n_layer) ?
+             build_dense_ffn(ffn_in, il) : build_moe(ffn_in, il);
+         ffn_out = build_sconv(ffn_out, model.layers[il].shortconv_mlp, off_mlp, il);
+         cb(ffn_out, "inkling_ffn_sconv", il);
+@@ -712,11 +791,19 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+ 
+     // conv states need every layer to see ALL tokens, so trim outputs only after the full stack
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
++
++    if (!is_mtp) {
++        // RMSNorm is row-wise, so norming before the output-row trim leaves the logits unchanged; the normed final
++        // hidden of every token is the MTP depth-0 input
++        cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
++    }
++    // an MTP depth has no final norm (chain_hidden_post_norm = false): its raw output feeds the next depth and the head
++    cb(cur, "h_nextn", -1);
++    res->t_h_nextn = cparams.embeddings_nextn_masked && inp_out_ids ? ggml_get_rows(ctx0, cur, inp_out_ids) : cur;
++    ggml_build_forward_expand(gf, res->t_h_nextn); // the masked get_rows has no other consumer
+     if (inp_out_ids) {
+         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+     }
+-
+-    cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
+     cb(cur, "result_norm", -1);
+     res->t_embd = cur;
+ 
+diff --git a/tools/inkling-mtp-check/mtp-check.cpp b/tools/inkling-mtp-check/mtp-check.cpp
+new file mode 100644
+index 000000000..2cf7eb567
+--- /dev/null
++++ b/tools/inkling-mtp-check/mtp-check.cpp
+@@ -0,0 +1,112 @@
++// Teacher-forced check of an MTP depth head, independent of the speculative driver:
++//   1. target decodes the text once, keeping h (embeddings_nextn) and its greedy next-token for every position;
++//   2. depth d decodes the same text in one batch with input pair (h_{p-1}, x_p) at position p
++//      (depth > 0 chains: its h input is depth d-1's output at p-1);
++//   3. reports how often depth d's argmax at p matches the target's greedy token at p + 1 + d.
++// usage: llama-mtp-check -m MODEL.gguf -f TEXT [-n N_TOKENS] [--depths D]
++#include "llama.h"
++#include "../../src/llama-ext.h"
++
++#include <cstdio>
++#include <cstring>
++#include <fstream>
++#include <sstream>
++#include <string>
++#include <vector>
++
++static int argmax(const float * v, int n) {
++    int best = 0;
++    for (int i = 1; i < n; ++i) if (v[i] > v[best]) best = i;
++    return best;
++}
++
++int main(int argc, char ** argv) {
++    std::string model_path, text_path;
++    int n_max = 1024, n_depths = 3;
++    for (int i = 1; i < argc; ++i) {
++        std::string a = argv[i];
++        if (a == "-m" && i + 1 < argc) model_path = argv[++i];
++        else if (a == "-f" && i + 1 < argc) text_path = argv[++i];
++        else if (a == "-n" && i + 1 < argc) n_max = atoi(argv[++i]);
++        else if (a == "--depths" && i + 1 < argc) n_depths = atoi(argv[++i]);
++    }
++    std::ifstream f(text_path); std::stringstream ss; ss << f.rdbuf(); const std::string text = ss.str();
++
++    llama_backend_init();
++    auto mp = llama_model_default_params();
++    mp.n_gpu_layers = 999;
++    mp.load_mtp     = true;
++    llama_model * model = llama_model_load_from_file(model_path.c_str(), mp);
++    if (!model) { fprintf(stderr, "load failed\n"); return 1; }
++    const llama_vocab * vocab = llama_model_get_vocab(model);
++    const int n_vocab = llama_vocab_n_tokens(vocab);
++    const int n_embd  = llama_model_n_embd_out(model);
++
++    std::vector<llama_token> toks(text.size() + 16);
++    int n_tok = llama_tokenize(vocab, text.c_str(), (int) text.size(), toks.data(), (int) toks.size(), false, true);
++    if (n_tok < 0) { fprintf(stderr, "tokenize failed\n"); return 1; }
++    toks.resize(std::min(n_tok, n_max));
++    const int N = (int) toks.size();
++    fprintf(stderr, "tokens: %d\n", N);
++
++    auto cp = llama_context_default_params();
++    cp.n_ctx = N + 64; cp.n_batch = N; cp.n_ubatch = 512; cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
++
++    // 1. target pass
++    llama_context * tgt = llama_init_from_model(model, cp);
++    llama_set_embeddings_nextn(tgt, true, false);
++    llama_batch b = llama_batch_init(N, 0, 1);
++    for (int i = 0; i < N; ++i) {
++        b.token[i] = toks[i]; b.pos[i] = i; b.n_seq_id[i] = 1; b.seq_id[i][0] = 0; b.logits[i] = 1;
++    }
++    b.n_tokens = N;
++    if (llama_decode(tgt, b) != 0) { fprintf(stderr, "target decode failed\n"); return 1; }
++    std::vector<float> h_tgt((size_t) N * n_embd);
++    std::vector<int>   greedy(N);
++    for (int i = 0; i < N; ++i) {
++        memcpy(h_tgt.data() + (size_t) i * n_embd, llama_get_embeddings_nextn_ith(tgt, i), n_embd * sizeof(float));
++        greedy[i] = argmax(llama_get_logits_ith(tgt, i), n_vocab); // target's prediction for token i + 1
++    }
++    int tgt_match = 0;
++    for (int i = 0; i + 1 < N; ++i) tgt_match += greedy[i] == toks[i + 1];
++    fprintf(stderr, "target greedy == text next token: %.3f\n", (double) tgt_match / (N - 1));
++
++    // 2. MTP depths, teacher-forced
++    auto cpm = cp; cpm.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
++    std::vector<float> h_in = h_tgt; // depth 0 input: target h
++    for (int d = 0; d < n_depths; ++d) {
++        llama_context * mtp = llama_init_from_model(model, cpm);
++        llama_set_embeddings_nextn(mtp, true, false);
++        llama_set_nextn_layer_offset(mtp, d);
++        llama_batch bm = llama_batch_init(N, n_embd, 1);
++        bm.token = (llama_token *) malloc(sizeof(llama_token) * N);
++        // position p: token x_p, hidden from position p - 1 (zeros at p = 0)
++        for (int p = 0; p < N; ++p) {
++            bm.token[p] = toks[p]; bm.pos[p] = p; bm.n_seq_id[p] = 1; bm.seq_id[p][0] = 0; bm.logits[p] = 1;
++            if (p == 0) memset(bm.embd, 0, n_embd * sizeof(float));
++            else memcpy(bm.embd + (size_t) p * n_embd, h_in.data() + (size_t) (p - 1) * n_embd, n_embd * sizeof(float));
++        }
++        bm.n_tokens = N;
++        if (llama_decode(mtp, bm) != 0) { fprintf(stderr, "mtp decode failed (depth %d)\n", d); return 1; }
++        // depth d at position p predicts the token at p + 1 + d... compare with the target's greedy there
++        int match = 0, total = 0, match_text = 0;
++        std::vector<float> h_out((size_t) N * n_embd);
++        for (int p = 1; p + 1 + d < N; ++p) {
++            const int pred = argmax(llama_get_logits_ith(mtp, p), n_vocab);
++            match      += pred == greedy[p + d];      // greedy[p + d] = target's prediction for token p + d + 1
++            match_text += pred == toks[p + 1 + d];
++            ++total;
++        }
++        for (int p = 0; p < N; ++p) memcpy(h_out.data() + (size_t) p * n_embd, llama_get_embeddings_nextn_ith(mtp, p), n_embd * sizeof(float));
++        printf("depth %d: argmax == target greedy %.3f, == text %.3f  (%d positions)\n",
++               d, (double) match / total, (double) match_text / total, total);
++        h_in = h_out; // depth d + 1 chains on depth d's output
++        free(bm.token); bm.token = nullptr;
++        llama_batch_free(bm);
++        llama_free(mtp);
++    }
++    llama_batch_free(b);
++    llama_free(tgt);
++    llama_model_free(model);
++    return 0;
++}
+-- 
+2.55.0
+

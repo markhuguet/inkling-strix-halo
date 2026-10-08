@@ -1,0 +1,259 @@
+From 06ac392c2b64bf6179239b562a671291568760e7 Mon Sep 17 00:00:00 2001
+From: mark <30506876+markhuguet@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 11:20:20 -0400
+Subject: [PATCH 09/15] banded FA: optional kv_len (src[6]) for padded,
+ graph-stable KV views; Inkling opt-in LLAMA_INKLING_PAD_KV=1
+
+The banded op aligned Q to the tail of an exact-length K view, so Inkling's graph changed shape every
+token and CUDA/HIP graphs never warmed up. ggml_flash_attn_ext_banded_set_kv_len passes the valid length
+as data (CPU + HIP banded kernels; MMA path declines it). With it, graphs replay every decode step, but
+on gfx1151/ROCm 7.14 decode is unchanged (tg64 18.9 vs 19.1, @16K 13.9 vs 13.9), so it stays opt-in.
+Output identical to exact views on a 15K-token prompt (250 greedy tokens).
+---
+ ggml/include/ggml.h                |  7 +++++
+ ggml/src/ggml-cpu/ops.cpp          |  6 ++--
+ ggml/src/ggml-cuda/fattn-banded.cu | 19 ++++++++----
+ ggml/src/ggml-cuda/fattn.cu        |  5 ++++
+ ggml/src/ggml.c                    | 10 +++++++
+ src/models/inkling.cpp             | 46 ++++++++++++++++++++++++++++--
+ 6 files changed, 84 insertions(+), 9 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index b0abc1547..e6a96a86e 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2512,6 +2512,13 @@ extern "C" {
+             float                 scale,
+             int64_t               rel_extent);
+ 
++    // optional: kv_len is an I32 [1] tensor holding the number of valid KV positions. With it, k/v/mask may be views
++    // padded past the valid length (padded cells must be masked -INF) and rel_dist uses (kv_len - n_batch) instead of
++    // (n_kv - n_batch), so the graph keeps its shape while the context grows (CUDA/HIP graph reuse).
++    GGML_API void ggml_flash_attn_ext_banded_set_kv_len(
++            struct ggml_tensor * a,
++            struct ggml_tensor * kv_len);
++
+     GGML_DEPRECATED(GGML_API void ggml_flash_attn_ext_set_prec(
+             struct ggml_tensor * a,
+             enum ggml_prec       prec),
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 1d89aaef6..d077b32f2 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -8783,8 +8783,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+             }
+ 
+             if (rel) {
+-                // the offset aligns a short decode Q block to the tail of K (FA4 seqlen_k - seqlen_q convention)
+-                const int64_t rel_dist = iq1 + (nek1 - neq1) - ic;
++                // the offset aligns a short decode Q block to the tail of K (FA4 seqlen_k - seqlen_q convention);
++                // with src[6] (kv_len) K may be padded past the valid length, so the tail is kv_len, not nek1
++                const int64_t n_kv_valid = dst->src[6] ? (int64_t) ((const int32_t *) dst->src[6]->data)[0] : nek1;
++                const int64_t rel_dist = iq1 + (n_kv_valid - neq1) - ic;
+                 if (rel_dist >= 0 && rel_dist < rel->ne[0]) {
+                     s += ggml_flash_attn_ext_banded_load(rel, iq1, iq2, iq3, rel_dist);
+                 }
+diff --git a/ggml/src/ggml-cuda/fattn-banded.cu b/ggml/src/ggml-cuda/fattn-banded.cu
+index 045eea23f..a0504c9c6 100644
+--- a/ggml/src/ggml-cuda/fattn-banded.cu
++++ b/ggml/src/ggml-cuda/fattn-banded.cu
+@@ -61,7 +61,8 @@ static __global__ void flash_attn_ext_banded_f32(
+         uint64_t r_nb1,
+         uint64_t r_nb2,
+         uint64_t r_nb3,
+-        int64_t rel_ne3) {
++        int64_t rel_ne3,
++        const int32_t * __restrict__ kv_len) {
+     constexpr int values_per_lane = D / WARP_SIZE;
+     static_assert(D == 64 || D == 128, "banded FA supports head dimensions 64 and 128");
+     static_assert(D % WARP_SIZE == 0, "head dimension must be divisible by warp size");
+@@ -90,7 +91,7 @@ static __global__ void flash_attn_ext_banded_f32(
+ 
+     float row_max = -INFINITY;
+     float row_sum = 0.0f;
+-    const int64_t q_offset = n_kv - n_q;
++    const int64_t q_offset = (kv_len ? (int64_t) kv_len[0] : n_kv) - n_q;
+ 
+     for (int64_t ik = 0; ik < n_kv; ++ik) {
+         // skip masked positions before touching K/V
+@@ -202,6 +203,7 @@ static __global__ void flash_attn_ext_banded_f32_split(
+         uint64_t r_nb2,
+         uint64_t r_nb3,
+         int64_t rel_ne3,
++        const int32_t * __restrict__ kv_len,
+         int n_split,
+         int64_t chunk) {
+     constexpr int values_per_lane = D / WARP_SIZE;
+@@ -228,7 +230,7 @@ static __global__ void flash_attn_ext_banded_f32_split(
+ 
+     float row_max = -INFINITY;
+     float row_sum = 0.0f;
+-    const int64_t q_offset = n_kv - n_q;
++    const int64_t q_offset = (kv_len ? (int64_t) kv_len[0] : n_kv) - n_q;
+     const int64_t k_begin  = int64_t(is)*chunk;
+     const int64_t k_end    = min(n_kv, k_begin + chunk);
+ 
+@@ -392,6 +394,10 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
+         (rel->ne[3] != 1 && rel->ne[3] != q->ne[3])) {
+         return false;
+     }
++    const ggml_tensor * kv_len = dst->src[6];
++    if (kv_len && (kv_len->type != GGML_TYPE_I32 || ggml_nelements(kv_len) != 1 || !m)) {
++        return false;
++    }
+     return !m || (m->type == GGML_TYPE_F16 && ggml_is_contiguous(m) &&
+         q->ne[2] % m->ne[2] == 0 && q->ne[3] % m->ne[3] == 0);
+ #endif
+@@ -419,6 +425,9 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
+ 
+     cudaStream_t stream = ctx.stream();
+ 
++    const ggml_tensor * kv_len = dst->src[6];
++    const int32_t * kv_len_d = kv_len ? (const int32_t *) kv_len->data : nullptr;
++
+     // Few query rows (decode, small speculative batches): split the key range so the GPU has enough warps.
+     // GGML_CUDA_BANDED_NO_SPLIT=1 restores the one-warp-per-row kernel for A/B checks.
+     // GGML_CUDA_BANDED_SPLIT_MIN sets the smallest n_kv that takes the split path (default 64; at 1024 decode
+@@ -450,7 +459,7 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
+             q->nb[1], q->nb[2], q->nb[3], k->nb[0], k->nb[1], k->nb[2], k->nb[3], \
+             v->nb[0], v->nb[1], v->nb[2], v->nb[3], \
+             m ? m->nb[1] : 0, m ? m->nb[2] : 0, m ? m->nb[3] : 0, \
+-            rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3], n_split, chunk); \
++            rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3], kv_len_d, n_split, chunk); \
+         flash_attn_ext_banded_combine<D><<<blocks_comb, threads_split, 0, stream>>>( \
+             part_vkq.get(), part_meta.get(), (float *) dst->data, q->ne[1], q->ne[2], n_split)
+ 
+@@ -476,7 +485,7 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
+         q->nb[1], q->nb[2], q->nb[3], k->nb[0], k->nb[1], k->nb[2], k->nb[3], \
+         v->nb[0], v->nb[1], v->nb[2], v->nb[3], \
+         m ? m->nb[1] : 0, m ? m->nb[2] : 0, m ? m->nb[3] : 0, \
+-        rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3])
++        rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3], kv_len_d)
+ 
+     if (q->ne[0] == 64) {
+         LAUNCH_BANDED(64);
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index 262fb5c7a..925b52c33 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -541,6 +541,11 @@ bool ggml_cuda_flash_attn_ext_banded_use_mma(const int device, const ggml_tensor
+         return false;
+     }
+ 
++    // the MMA kernel aligns Q to the tail of the K view (ne11 - ne01); a padded view with kv_len needs the banded kernels
++    if (dst->src[6]) {
++        return false;
++    }
++
+     // the MMA ABI indexes rel linearly and by Q's batch
+     if (rel->type != GGML_TYPE_F32 || !ggml_is_contiguous(rel) ||
+         rel->ne[3] != Q->ne[3] || rel->ne[0] > (1 << 20)) {
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 041ed7cd1..0f7e8991a 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5590,6 +5590,16 @@ struct ggml_tensor * ggml_flash_attn_ext_banded(
+     return result;
+ }
+ 
++void ggml_flash_attn_ext_banded_set_kv_len(
++        struct ggml_tensor * a,
++        struct ggml_tensor * kv_len) {
++    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
++    GGML_ASSERT(kv_len->type == GGML_TYPE_I32 && ggml_nelements(kv_len) == 1);
++    GGML_ASSERT(a->src[3] != NULL); // padded cells must be masked
++
++    a->src[6] = kv_len;
++}
++
+ void ggml_flash_attn_ext_set_prec(
+         struct ggml_tensor * a,
+         enum ggml_prec       prec) {
+diff --git a/src/models/inkling.cpp b/src/models/inkling.cpp
+index 0a2ecb628..0af1c3d64 100644
+--- a/src/models/inkling.cpp
++++ b/src/models/inkling.cpp
+@@ -146,6 +146,16 @@ public:
+             mctx->get_attn()->get_base()->set_input_pos_rel_flat(rel_idx, ubatch, hparams.inkling_rel_extent);
+         }
+ 
++        if (kv_len_base) {
++            GGML_ASSERT(ggml_backend_buffer_is_host(kv_len_base->buffer));
++            ((int32_t *) kv_len_base->data)[0] = (int32_t) mctx->get_attn()->get_base()->get_n_kv_pos_contiguous();
++        }
++
++        if (kv_len_swa) {
++            GGML_ASSERT(ggml_backend_buffer_is_host(kv_len_swa->buffer));
++            ((int32_t *) kv_len_swa->data)[0] = (int32_t) mctx->get_attn()->get_swa()->get_n_kv_pos_contiguous();
++        }
++
+         if (rel_idx_swa) {
+             mctx->get_attn()->get_swa()->set_input_pos_rel_flat(rel_idx_swa, ubatch, hparams.inkling_rel_extent_swa);
+         }
+@@ -182,6 +192,8 @@ public:
+     ggml_tensor * rel_idx_swa = nullptr; // I32 [n_kv_swa, n_tokens]
+     ggml_tensor * vocab_mask  = nullptr; // F32 [n_vocab]
+     ggml_tensor * shexp_idx   = nullptr; // I32 [n_shexp, n_tokens], constant 0..n_shexp-1
++    ggml_tensor * kv_len_base = nullptr; // I32 [1], valid KV positions for padded banded views (global layers)
++    ggml_tensor * kv_len_swa  = nullptr; // I32 [1], same for the SWA cache
+ 
+     const llama_hparams hparams;
+ 
+@@ -291,6 +303,30 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+         ggml_set_name(inp->shexp_idx, "inkling_shexp_idx");
+     }
+ 
++    // LLAMA_INKLING_PAD_KV=1: banded layers view K/V/mask at the cache's padded n_kv and get the valid length as data,
++    // so the graph keeps its shape token to token and CUDA/HIP graphs are reused. Opt-in: on gfx1151 (ROCm 7.14) graph
++    // replay measured no decode gain, and on CUDA a kv_len op cannot take the MMA banded kernel.
++    static const bool exact_kv = getenv("LLAMA_INKLING_PAD_KV") == nullptr;
++    bool any_banded_global = false;
++    bool any_banded_swa    = false;
++    for (int il = 0; il < n_layer; ++il) {
++        if (use_banded_flash(il)) {
++            (hparams.is_swa(il) ? any_banded_swa : any_banded_global) = true;
++        }
++    }
++    if (!exact_kv && any_banded_global) {
++        inp->kv_len_base = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
++        ggml_set_input(inp->kv_len_base);
++        ggml_set_name(inp->kv_len_base, "inkling_kv_len");
++    }
++    if (!exact_kv && any_banded_swa) {
++        inp->kv_len_swa = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
++        ggml_set_input(inp->kv_len_swa);
++        ggml_set_name(inp->kv_len_swa, "inkling_kv_len_swa");
++    }
++
++    ggml_tensor * kv_len_base = inp->kv_len_base;
++    ggml_tensor * kv_len_swa  = inp->kv_len_swa;
+     ggml_tensor * tau         = inp->tau;
+     ggml_tensor * rel_idx     = inp->rel_idx;
+     ggml_tensor * rel_idx_swa = inp->rel_idx_swa;
+@@ -422,8 +458,11 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+             ggml_tensor * k_fa = cache->get_k(ctx0, il);
+             ggml_tensor * v_fa = cache->get_v(ctx0, il);
+ 
+-            const int64_t n_kv_flash = is_swa ? n_kv_flash_swa : n_kv_flash_base;
+-            GGML_ASSERT(n_stream == 1 && n_kv_flash <= k_fa->ne[2]);
++            ggml_tensor * kv_len = is_swa ? kv_len_swa : kv_len_base;
++            const int64_t n_kv_valid = is_swa ? n_kv_flash_swa : n_kv_flash_base;
++            GGML_ASSERT(n_stream == 1 && n_kv_valid <= k_fa->ne[2]);
++            // with kv_len the view keeps the cache's padded length (masked past n_kv_valid)
++            const int64_t n_kv_flash = kv_len ? k_fa->ne[2] : n_kv_valid;
+ 
+             k_fa = ggml_view_4d(ctx0, k_fa,
+                     k_fa->ne[0], k_fa->ne[1], n_kv_flash, k_fa->ne[3],
+@@ -465,6 +504,9 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+ 
+             cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, mask, rel_fa,
+                     1.0f/float(head_dim), rel_extent);
++            if (kv_len) {
++                ggml_flash_attn_ext_banded_set_kv_len(cur, kv_len);
++            }
+             ggml_prec_set_acc(cur, GGML_PREC_F32);
+             res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+ 
+-- 
+2.55.0
+

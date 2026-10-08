@@ -1,0 +1,557 @@
+From 7161ac1843392df110135ebd333ea0e9789c671a Mon Sep 17 00:00:00 2001
+From: mark <30506876+markhuguet@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 16:09:49 -0400
+Subject: [PATCH 13/15] banded FA: tiled prompt kernel; optional rel_idx so
+ non-contiguous caches (wrapped SWA) stay banded
+
+- flash_attn_ext_banded_f32_tiled: for > 8 query rows, a block of 32 query-head rows (one KV head's
+  group) streams K/V tiles of 32 keys through shared memory; lane-per-key scores, f32 online softmax.
+- ggml_flash_attn_ext_banded_set_rel_idx (src[7]): llama's flat q*(E+1)+dist indices replace the
+  K-tail alignment (CPU and all HIP banded kernels; MMA declines). Inkling routes layers whose cache
+  is not position-contiguous (wrapped SWA) to the banded kernels instead of dense softmax + gathered bias.
+- test-backend-ops: 4 rel_idx cases (17/17 pass vs CPU).
+gfx1151 Inkling pp512 @8K 122 -> ~178 t/s (tiled +54%, rel_idx +9-12% on top), decode @8K +2-7%.
+Accuracy vs an f32 CPU reference (8K ctx, 2 chunks): mean KLD tiled+rel_idx 0.168, tiled+dense 0.163,
+old+dense 0.172 (+-0.009): numerically equivalent. Off switches: GGML_CUDA_BANDED_NO_TILED=1,
+LLAMA_INKLING_NO_BANDED_IDX=1.
+---
+ ggml/include/ggml.h                |   7 +
+ ggml/src/ggml-cpu/ops.cpp          |   5 +-
+ ggml/src/ggml-cuda/fattn-banded.cu | 229 ++++++++++++++++++++++++++++-
+ ggml/src/ggml-cuda/fattn.cu        |   2 +-
+ ggml/src/ggml.c                    |  12 ++
+ src/models/inkling.cpp             |  28 +++-
+ tests/test-backend-ops.cpp         |  44 +++++-
+ 7 files changed, 313 insertions(+), 14 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index e6a96a86e..2b52f77c4 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2519,6 +2519,13 @@ extern "C" {
+             struct ggml_tensor * a,
+             struct ggml_tensor * kv_len);
+ 
++    // optional: rel_idx is an I32 [n_kv, n_batch] tensor in llama's flat encoding, rel_idx[q, k] = q*(rel_extent+1) + dist
++    // with dist == rel_extent meaning "no bias". With it rel_dist comes from the cells' real positions instead of
++    // (n_kv - n_batch + q - k), so K/V need not be position-contiguous (wrapped SWA caches, several sequences).
++    GGML_API void ggml_flash_attn_ext_banded_set_rel_idx(
++            struct ggml_tensor * a,
++            struct ggml_tensor * rel_idx);
++
+     GGML_DEPRECATED(GGML_API void ggml_flash_attn_ext_set_prec(
+             struct ggml_tensor * a,
+             enum ggml_prec       prec),
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index d077b32f2..dd063c6b4 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -8786,7 +8786,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+                 // the offset aligns a short decode Q block to the tail of K (FA4 seqlen_k - seqlen_q convention);
+                 // with src[6] (kv_len) K may be padded past the valid length, so the tail is kv_len, not nek1
+                 const int64_t n_kv_valid = dst->src[6] ? (int64_t) ((const int32_t *) dst->src[6]->data)[0] : nek1;
+-                const int64_t rel_dist = iq1 + (n_kv_valid - neq1) - ic;
++                // src[7] (rel_idx): flat q*(E+1) + dist from the cells' real positions
++                const int64_t rel_dist = dst->src[7] ?
++                    (int64_t) ((const int32_t *) dst->src[7]->data)[iq1*nek1 + ic] - iq1*(rel->ne[0] + 1) :
++                    iq1 + (n_kv_valid - neq1) - ic;
+                 if (rel_dist >= 0 && rel_dist < rel->ne[0]) {
+                     s += ggml_flash_attn_ext_banded_load(rel, iq1, iq2, iq3, rel_dist);
+                 }
+diff --git a/ggml/src/ggml-cuda/fattn-banded.cu b/ggml/src/ggml-cuda/fattn-banded.cu
+index a0504c9c6..583d29902 100644
+--- a/ggml/src/ggml-cuda/fattn-banded.cu
++++ b/ggml/src/ggml-cuda/fattn-banded.cu
+@@ -62,7 +62,9 @@ static __global__ void flash_attn_ext_banded_f32(
+         uint64_t r_nb2,
+         uint64_t r_nb3,
+         int64_t rel_ne3,
+-        const int32_t * __restrict__ kv_len) {
++        const int32_t * __restrict__ kv_len,
++        const int32_t * __restrict__ rel_idx,
++        int64_t rel_idx_ld) {
+     constexpr int values_per_lane = D / WARP_SIZE;
+     static_assert(D == 64 || D == 128, "banded FA supports head dimensions 64 and 128");
+     static_assert(D % WARP_SIZE == 0, "head dimension must be divisible by warp size");
+@@ -112,7 +114,7 @@ static __global__ void flash_attn_ext_banded_f32(
+ 
+         float score = dot * scale;
+         if (lane == 0) {
+-            const int64_t rel_dist = iq + q_offset - ik;
++            const int64_t rel_dist = rel_idx ? (int64_t) rel_idx[iq*rel_idx_ld + ik] - iq*(rel_extent + 1) : iq + q_offset - ik;
+             if (rel_dist >= 0 && rel_dist < rel_extent) {
+                 const char * rel_value = rel +
+                     uint64_t(rel_dist)*r_nb0 + uint64_t(ih)*r_nb1 +
+@@ -204,6 +206,8 @@ static __global__ void flash_attn_ext_banded_f32_split(
+         uint64_t r_nb3,
+         int64_t rel_ne3,
+         const int32_t * __restrict__ kv_len,
++        const int32_t * __restrict__ rel_idx,
++        int64_t rel_idx_ld,
+         int n_split,
+         int64_t chunk) {
+     constexpr int values_per_lane = D / WARP_SIZE;
+@@ -252,7 +256,7 @@ static __global__ void flash_attn_ext_banded_f32_split(
+ 
+         float score = dot * scale;
+         if (lane == 0) {
+-            const int64_t rel_dist = iq + q_offset - ik;
++            const int64_t rel_dist = rel_idx ? (int64_t) rel_idx[iq*rel_idx_ld + ik] - iq*(rel_extent + 1) : iq + q_offset - ik;
+             if (rel_dist >= 0 && rel_dist < rel_extent) {
+                 const char * rel_value = rel +
+                     uint64_t(rel_dist)*r_nb0 + uint64_t(ih)*r_nb1 +
+@@ -350,6 +354,184 @@ static __global__ void flash_attn_ext_banded_combine(
+     }
+ }
+ 
++// Tiled variant for prompt batches. A block owns MAX_ROWS rows = (MAX_ROWS/G queries) x (the G query heads of one KV
++// head) and walks K/V in tiles of BK keys staged in shared memory (f32), so each K/V row is loaded once per block
++// instead of once per query row. Scores: lane k of a warp computes the full dot product for key k of the tile against
++// the row's query (read from shared memory), then one max and one sum reduction per tile; PV: each lane owns D/WARP_SIZE
++// output dims. Same score as the other banded kernels: dot*scale + rel bias (0 <= dist < rel_extent) + mask.
++template<int D, int MAX_ROWS, int BK, int NWARPS>
++static __global__ void __launch_bounds__(NWARPS*WARP_SIZE, 1) flash_attn_ext_banded_f32_tiled(
++        const char * __restrict__ q,
++        const char * __restrict__ k,
++        const char * __restrict__ v,
++        const char * __restrict__ mask,
++        const char * __restrict__ rel,
++        float      * __restrict__ dst,
++        float scale,
++        int type_k,
++        int type_v,
++        int type_rel,
++        int64_t n_q,
++        int64_t n_kv,
++        int64_t n_head_q,
++        int64_t n_head_kv,
++        int64_t rel_extent,
++        int64_t mask_ne2,
++        int64_t mask_ne3,
++        uint64_t q_nb1,
++        uint64_t q_nb2,
++        uint64_t q_nb3,
++        uint64_t k_nb0,
++        uint64_t k_nb1,
++        uint64_t k_nb2,
++        uint64_t k_nb3,
++        uint64_t v_nb0,
++        uint64_t v_nb1,
++        uint64_t v_nb2,
++        uint64_t v_nb3,
++        uint64_t m_nb1,
++        uint64_t m_nb2,
++        uint64_t m_nb3,
++        uint64_t r_nb0,
++        uint64_t r_nb1,
++        uint64_t r_nb2,
++        uint64_t r_nb3,
++        int64_t rel_ne3,
++        const int32_t * __restrict__ kv_len,
++        const int32_t * __restrict__ rel_idx,
++        int64_t rel_idx_ld) {
++    static_assert(BK == WARP_SIZE, "one key per lane");
++    static_assert(D % WARP_SIZE == 0, "head dimension must be divisible by warp size");
++    static_assert(MAX_ROWS % NWARPS == 0, "rows must split evenly over warps");
++    constexpr int VPL           = D / WARP_SIZE;        // output dims per lane
++    constexpr int ROWS_PER_WARP = MAX_ROWS / NWARPS;
++    constexpr int SK_STRIDE     = D + 1;                // pad: lane k reads row k, column d -> no bank conflicts
++
++    __shared__ float sQ[MAX_ROWS][D];
++    __shared__ float sK[BK][SK_STRIDE];
++    __shared__ float sV[BK][D];
++
++    const int lane = threadIdx.x % WARP_SIZE;
++    const int warp = threadIdx.x / WARP_SIZE;
++    const int tid  = threadIdx.x;
++
++    const int64_t G     = n_head_q / n_head_kv;         // query heads per KV head
++    const int64_t BQ    = MAX_ROWS / G;                 // queries per block
++    const int64_t ih_kv = blockIdx.y;
++    const int64_t ib    = blockIdx.z;
++    const int64_t iq0   = (int64_t) blockIdx.x * BQ;
++    const int64_t q_offset = (kv_len ? (int64_t) kv_len[0] : n_kv) - n_q;
++
++    // stage the block's query rows (row r -> query iq0 + r/G, head ih_kv*G + r%G); rows past n_q are zero
++    for (int idx = tid; idx < MAX_ROWS*D; idx += NWARPS*WARP_SIZE) {
++        const int r = idx / D, d = idx % D;
++        const int64_t iq = iq0 + r / G;
++        const int64_t ih = ih_kv*G + r % G;
++        sQ[r][d] = iq < n_q ? *(const float *) (q + uint64_t(iq)*q_nb1 + uint64_t(ih)*q_nb2 + uint64_t(ib)*q_nb3 + uint64_t(d)*sizeof(float)) : 0.0f;
++    }
++
++    float out[ROWS_PER_WARP][VPL];
++    float row_max[ROWS_PER_WARP];
++    float row_sum[ROWS_PER_WARP];
++#pragma unroll
++    for (int rr = 0; rr < ROWS_PER_WARP; ++rr) {
++        row_max[rr] = -INFINITY;
++        row_sum[rr] = 0.0f;
++#pragma unroll
++        for (int j = 0; j < VPL; ++j) {
++            out[rr][j] = 0.0f;
++        }
++    }
++
++    for (int64_t k0 = 0; k0 < n_kv; k0 += BK) {
++        __syncthreads(); // previous tile fully consumed (also orders the sQ staging before first use)
++        for (int idx = tid; idx < BK*D; idx += NWARPS*WARP_SIZE) {
++            const int kk = idx / D, d = idx % D;
++            const int64_t ik = k0 + kk;
++            float kv_k = 0.0f, kv_v = 0.0f;
++            if (ik < n_kv) {
++                kv_k = fattn_banded_load(k + uint64_t(ik)*k_nb1 + uint64_t(ih_kv)*k_nb2 + uint64_t(ib)*k_nb3 + uint64_t(d)*k_nb0, type_k);
++                kv_v = fattn_banded_load(v + uint64_t(ik)*v_nb1 + uint64_t(ih_kv)*v_nb2 + uint64_t(ib)*v_nb3 + uint64_t(d)*v_nb0, type_v);
++            }
++            sK[kk][d] = kv_k;
++            sV[kk][d] = kv_v;
++        }
++        __syncthreads();
++
++        const int64_t ik = k0 + lane; // this lane's key
++#pragma unroll
++        for (int rr = 0; rr < ROWS_PER_WARP; ++rr) {
++            const int r = warp + rr*NWARPS;
++            const int64_t iq = iq0 + r / G;
++            const int64_t ih = ih_kv*G + r % G;
++            if (iq >= n_q) {
++                continue; // warp-uniform
++            }
++
++            float score = -INFINITY;
++            if (ik < n_kv) {
++                float mv = 0.0f;
++                if (mask) {
++                    mv = __half2float(*(const half *) (mask + uint64_t(ik)*sizeof(half) + uint64_t(iq)*m_nb1 +
++                        uint64_t(ih % mask_ne2)*m_nb2 + uint64_t(ib % mask_ne3)*m_nb3));
++                }
++                if (mv != -INFINITY) {
++                    float dot = 0.0f;
++#pragma unroll
++                    for (int d = 0; d < D; ++d) {
++                        dot += sQ[r][d] * sK[lane][d];
++                    }
++                    score = dot * scale;
++                    const int64_t rel_dist = rel_idx ? (int64_t) rel_idx[iq*rel_idx_ld + ik] - iq*(rel_extent + 1) : iq + q_offset - ik;
++                    if (rel_dist >= 0 && rel_dist < rel_extent) {
++                        score += fattn_banded_load(rel + uint64_t(rel_dist)*r_nb0 + uint64_t(ih)*r_nb1 +
++                            uint64_t(iq)*r_nb2 + uint64_t(ib % rel_ne3)*r_nb3, type_rel);
++                    }
++                    score += mv;
++                }
++            }
++
++            const float tile_max = warp_reduce_max(score);
++            const float new_max  = fmaxf(row_max[rr], tile_max);
++            if (new_max == -INFINITY) {
++                continue; // nothing visible yet for this row (warp-uniform)
++            }
++            const float p         = score == -INFINITY ? 0.0f : expf(score - new_max);
++            const float old_scale = row_max[rr] == -INFINITY ? 0.0f : expf(row_max[rr] - new_max);
++            row_sum[rr] = row_sum[rr]*old_scale + warp_reduce_sum(p);
++            row_max[rr] = new_max;
++#pragma unroll
++            for (int j = 0; j < VPL; ++j) {
++                out[rr][j] *= old_scale;
++            }
++#pragma unroll
++            for (int kk = 0; kk < BK; ++kk) {
++                const float pk = __shfl_sync(0xffffffff, p, kk, WARP_SIZE);
++#pragma unroll
++                for (int j = 0; j < VPL; ++j) {
++                    out[rr][j] += pk * sV[kk][lane + j*WARP_SIZE];
++                }
++            }
++        }
++    }
++
++#pragma unroll
++    for (int rr = 0; rr < ROWS_PER_WARP; ++rr) {
++        const int r = warp + rr*NWARPS;
++        const int64_t iq = iq0 + r / G;
++        const int64_t ih = ih_kv*G + r % G;
++        if (iq >= n_q) {
++            continue;
++        }
++        const float inv_sum = row_sum[rr] == 0.0f ? 0.0f : 1.0f/row_sum[rr];
++        float * dst_row = dst + ((ib*n_q + iq)*n_head_q + ih)*D;
++#pragma unroll
++        for (int j = 0; j < VPL; ++j) {
++            dst_row[lane + j*WARP_SIZE] = out[rr][j]*inv_sum;
++        }
++    }
++}
++
+ static bool fattn_banded_type_supported(ggml_type type) {
+     return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
+ }
+@@ -398,6 +580,10 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
+     if (kv_len && (kv_len->type != GGML_TYPE_I32 || ggml_nelements(kv_len) != 1 || !m)) {
+         return false;
+     }
++    const ggml_tensor * ridx = dst->src[7];
++    if (ridx && (ridx->type != GGML_TYPE_I32 || ridx->ne[0] != k->ne[1] || ridx->ne[1] != q->ne[1] || ridx->nb[0] != sizeof(int32_t))) {
++        return false;
++    }
+     return !m || (m->type == GGML_TYPE_F16 && ggml_is_contiguous(m) &&
+         q->ne[2] % m->ne[2] == 0 && q->ne[3] % m->ne[3] == 0);
+ #endif
+@@ -427,6 +613,9 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
+ 
+     const ggml_tensor * kv_len = dst->src[6];
+     const int32_t * kv_len_d = kv_len ? (const int32_t *) kv_len->data : nullptr;
++    const ggml_tensor * rel_idx_t = dst->src[7];
++    const int32_t * rel_idx_d  = rel_idx_t ? (const int32_t *) rel_idx_t->data : nullptr;
++    const int64_t   rel_idx_ld = rel_idx_t ? rel_idx_t->nb[1] / sizeof(int32_t) : 0;
+ 
+     // Few query rows (decode, small speculative batches): split the key range so the GPU has enough warps.
+     // GGML_CUDA_BANDED_NO_SPLIT=1 restores the one-warp-per-row kernel for A/B checks.
+@@ -459,7 +648,7 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
+             q->nb[1], q->nb[2], q->nb[3], k->nb[0], k->nb[1], k->nb[2], k->nb[3], \
+             v->nb[0], v->nb[1], v->nb[2], v->nb[3], \
+             m ? m->nb[1] : 0, m ? m->nb[2] : 0, m ? m->nb[3] : 0, \
+-            rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3], kv_len_d, n_split, chunk); \
++            rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3], kv_len_d, rel_idx_d, rel_idx_ld, n_split, chunk); \
+         flash_attn_ext_banded_combine<D><<<blocks_comb, threads_split, 0, stream>>>( \
+             part_vkq.get(), part_meta.get(), (float *) dst->data, q->ne[1], q->ne[2], n_split)
+ 
+@@ -472,6 +661,36 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
+         return;
+     }
+ 
++    // Prompt batches: tiled kernel (K/V staged in shared memory, reused by up to 32 query-head rows).
++    // GGML_CUDA_BANDED_NO_TILED=1 keeps the one-warp-per-row kernel below for A/B checks.
++    static const bool no_tiled = getenv("GGML_CUDA_BANDED_NO_TILED") != nullptr;
++    {
++        constexpr int TILE_ROWS = 32, TILE_BK = 32, TILE_WARPS = 8;
++        const int64_t G = q->ne[2] / k->ne[2];
++        if (!no_tiled && q->ne[1] > 8 && G >= 1 && G <= TILE_ROWS && TILE_ROWS % G == 0 && WARP_SIZE == 32) {
++            const int64_t BQ = TILE_ROWS / G;
++            const dim3 blocks_t((q->ne[1] + BQ - 1) / BQ, k->ne[2], q->ne[3]);
++            const dim3 threads_t(TILE_WARPS * WARP_SIZE, 1, 1);
++#define LAUNCH_BANDED_TILED(D) \
++            flash_attn_ext_banded_f32_tiled<D, TILE_ROWS, TILE_BK, TILE_WARPS><<<blocks_t, threads_t, 0, stream>>>( \
++                (const char *) q->data, (const char *) k->data, (const char *) v->data, \
++                m ? (const char *) m->data : nullptr, (const char *) rel->data, (float *) dst->data, \
++                scale, k->type, v->type, rel->type, q->ne[1], k->ne[1], q->ne[2], k->ne[2], \
++                rel_extent, m ? m->ne[2] : 1, m ? m->ne[3] : 1, \
++                q->nb[1], q->nb[2], q->nb[3], k->nb[0], k->nb[1], k->nb[2], k->nb[3], \
++                v->nb[0], v->nb[1], v->nb[2], v->nb[3], \
++                m ? m->nb[1] : 0, m ? m->nb[2] : 0, m ? m->nb[3] : 0, \
++                rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3], kv_len_d, rel_idx_d, rel_idx_ld)
++            if (q->ne[0] == 64) {
++                LAUNCH_BANDED_TILED(64);
++            } else {
++                LAUNCH_BANDED_TILED(128);
++            }
++#undef LAUNCH_BANDED_TILED
++            return;
++        }
++    }
++
+     constexpr int warps_per_block = 4;
+     const dim3 blocks((q->ne[1] + warps_per_block - 1) / warps_per_block, q->ne[2], q->ne[3]);
+     const dim3 threads(warps_per_block * WARP_SIZE, 1, 1);
+@@ -485,7 +704,7 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
+         q->nb[1], q->nb[2], q->nb[3], k->nb[0], k->nb[1], k->nb[2], k->nb[3], \
+         v->nb[0], v->nb[1], v->nb[2], v->nb[3], \
+         m ? m->nb[1] : 0, m ? m->nb[2] : 0, m ? m->nb[3] : 0, \
+-        rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3], kv_len_d)
++        rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3], kv_len_d, rel_idx_d, rel_idx_ld)
+ 
+     if (q->ne[0] == 64) {
+         LAUNCH_BANDED(64);
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index 925b52c33..437638709 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -542,7 +542,7 @@ bool ggml_cuda_flash_attn_ext_banded_use_mma(const int device, const ggml_tensor
+     }
+ 
+     // the MMA kernel aligns Q to the tail of the K view (ne11 - ne01); a padded view with kv_len needs the banded kernels
+-    if (dst->src[6]) {
++    if (dst->src[6] || dst->src[7]) {
+         return false;
+     }
+ 
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 0f7e8991a..392c34928 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5600,6 +5600,18 @@ void ggml_flash_attn_ext_banded_set_kv_len(
+     a->src[6] = kv_len;
+ }
+ 
++void ggml_flash_attn_ext_banded_set_rel_idx(
++        struct ggml_tensor * a,
++        struct ggml_tensor * rel_idx) {
++    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT_BANDED);
++    GGML_ASSERT(rel_idx->type == GGML_TYPE_I32 && ggml_is_contiguous(rel_idx));
++    GGML_ASSERT(rel_idx->ne[0] == a->src[1]->ne[1]); // n_kv
++    GGML_ASSERT(rel_idx->ne[1] == a->src[0]->ne[1]); // n_batch
++    GGML_ASSERT(a->src[6] == NULL);                  // positions come from rel_idx, not from a valid-length tail
++
++    a->src[7] = rel_idx;
++}
++
+ void ggml_flash_attn_ext_set_prec(
+         struct ggml_tensor * a,
+         enum ggml_prec       prec) {
+diff --git a/src/models/inkling.cpp b/src/models/inkling.cpp
+index 9f8953107..cb6cf1cfd 100644
+--- a/src/models/inkling.cpp
++++ b/src/models/inkling.cpp
+@@ -258,6 +258,20 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+             banded_cache_type_supported(cache->type_v());
+     };
+ 
++    // Layers whose cache is not position-contiguous (wrapped SWA cache, several sequences) can still take the banded
++    // kernels when the op gets the per-cell distances (rel_idx) instead of the K-tail alignment.
++    // LLAMA_INKLING_NO_BANDED_IDX=1 keeps them on the dense softmax path.
++    static const bool no_banded_idx = getenv("LLAMA_INKLING_NO_BANDED_IDX") != nullptr;
++    const auto use_banded_idx = [&](int il) {
++        const auto * cache = hparams.is_swa(il) ? mctx_attn->get_swa() : mctx_attn->get_base();
++        return !no_banded_idx && cparams.flash_attn && !use_banded_flash(il) &&
++            (head_dim == 64 || head_dim == 128) &&
++            hparams.n_embd_head_v(il) == head_dim &&
++            hparams.n_head(il) % hparams.n_head_kv(il) == 0 &&
++            banded_cache_type_supported(cache->type_k()) &&
++            banded_cache_type_supported(cache->type_v());
++    };
++
+     for (int il = 0; il < n_layer; ++il) {
+         if (hparams.is_swa(il)) {
+             needs_rel_idx_local |= !use_banded_flash(il);
+@@ -433,7 +447,8 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+         const int64_t n_stream = (is_swa ? inp_attn->get_kq_mask_swa() : inp_attn->get_kq_mask())->ne[3];
+         GGML_ASSERT(n_tokens % n_stream == 0);
+ 
+-        if (use_banded_flash(il)) {
++        const bool banded_idx = use_banded_idx(il) && n_stream == 1;
++        if (use_banded_flash(il) || banded_idx) {
+             GGML_ASSERT(q->type == GGML_TYPE_F32);
+             auto * k_rot = is_swa ? inp_attn->self_k_rot_swa : inp_attn->self_k_rot;
+             auto * v_rot = is_swa ? inp_attn->self_v_rot_swa : inp_attn->self_v_rot;
+@@ -463,11 +478,13 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+             ggml_tensor * k_fa = cache->get_k(ctx0, il);
+             ggml_tensor * v_fa = cache->get_v(ctx0, il);
+ 
+-            ggml_tensor * kv_len = is_swa ? kv_len_swa : kv_len_base;
++            ggml_tensor * kv_len = banded_idx ? nullptr : (is_swa ? kv_len_swa : kv_len_base);
++            ggml_tensor * idx_fa = banded_idx ? (is_swa ? rel_idx_swa : rel_idx) : nullptr;
+             const int64_t n_kv_valid = is_swa ? n_kv_flash_swa : n_kv_flash_base;
+             GGML_ASSERT(n_stream == 1 && n_kv_valid <= k_fa->ne[2]);
+-            // with kv_len the view keeps the cache's padded length (masked past n_kv_valid)
+-            const int64_t n_kv_flash = kv_len ? k_fa->ne[2] : n_kv_valid;
++            // kv_len / rel_idx: the view keeps the cache's full n_kv (cells not visible are masked)
++            const int64_t n_kv_flash = (kv_len || idx_fa) ? k_fa->ne[2] : n_kv_valid;
++            GGML_ASSERT(!idx_fa || idx_fa->ne[0] == n_kv_flash);
+ 
+             k_fa = ggml_view_4d(ctx0, k_fa,
+                     k_fa->ne[0], k_fa->ne[1], n_kv_flash, k_fa->ne[3],
+@@ -517,6 +534,9 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+             if (kv_len) {
+                 ggml_flash_attn_ext_banded_set_kv_len(cur, kv_len);
+             }
++            if (idx_fa) {
++                ggml_flash_attn_ext_banded_set_rel_idx(cur, idx_fa);
++            }
+             ggml_prec_set_acc(cur, GGML_PREC_F32);
+             res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index d47f4c071..71cc96dc7 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -7876,9 +7876,11 @@ struct test_flash_attn_ext_banded : public test_case {
+     const ggml_type kv_type;
+     const ggml_type rel_type;
+     const bool strided;
++    const bool use_rel_idx; // positions from an I32 rel_idx (wrapped-cache layout) instead of the K-tail alignment
+ 
+     std::string vars() override {
+-        return VARS_TO_STR10(d, n_head, n_head_kv, n_q, n_kv, rel_extent, mask_kind, kv_type, rel_type, strided);
++        return VARS_TO_STR10(d, n_head, n_head_kv, n_q, n_kv, rel_extent, mask_kind, kv_type, rel_type, strided) +
++            ",rel_idx=" + std::to_string(use_rel_idx);
+     }
+ 
+     double max_nmse_err() override {
+@@ -7898,9 +7900,10 @@ struct test_flash_attn_ext_banded : public test_case {
+     test_flash_attn_ext_banded(
+             int64_t d, int64_t n_head, int64_t n_head_kv,
+             int64_t n_q, int64_t n_kv, int64_t rel_extent,
+-            int mask_kind, ggml_type kv_type, ggml_type rel_type, bool strided = false)
++            int mask_kind, ggml_type kv_type, ggml_type rel_type, bool strided = false, bool use_rel_idx = false)
+         : d(d), n_head(n_head), n_head_kv(n_head_kv), n_q(n_q), n_kv(n_kv),
+-          rel_extent(rel_extent), mask_kind(mask_kind), kv_type(kv_type), rel_type(rel_type), strided(strided) {}
++          rel_extent(rel_extent), mask_kind(mask_kind), kv_type(kv_type), rel_type(rel_type), strided(strided),
++          use_rel_idx(use_rel_idx) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, n_q, n_head, 1);
+@@ -7932,6 +7935,11 @@ struct test_flash_attn_ext_banded : public test_case {
+         }
+ 
+         ggml_tensor * out = ggml_flash_attn_ext_banded(ctx, q, k, v, m, r, 1.0f/float(d), rel_extent);
++        if (use_rel_idx) {
++            ggml_tensor * idx = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_q);
++            ggml_set_name(idx, "rel_idx");
++            ggml_flash_attn_ext_banded_set_rel_idx(out, idx);
++        }
+         ggml_prec_set_acc(out, GGML_PREC_F32);
+         ggml_set_name(out, "out");
+         return out;
+@@ -7949,6 +7957,19 @@ struct test_flash_attn_ext_banded : public test_case {
+                     }
+                 }
+                 ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
++            } else if (strcmp(t->name, "rel_idx") == 0) {
++                // wrapped cache: cell ik holds position (ik + shift) % n_kv, queries are the newest positions
++                std::vector<int32_t> data(n_q*n_kv);
++                const int64_t shift = n_kv/3;
++                for (int64_t iq = 0; iq < n_q; ++iq) {
++                    const int64_t qpos = n_kv - n_q + iq;
++                    for (int64_t ik = 0; ik < n_kv; ++ik) {
++                        const int64_t dist = qpos - (ik + shift) % n_kv;
++                        const int64_t rel  = dist >= 0 && dist < rel_extent ? dist : rel_extent;
++                        data[iq*n_kv + ik] = (int32_t) (iq*(rel_extent + 1) + rel);
++                    }
++                }
++                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(data[0]));
+             } else if (strcmp(t->name, "rel_logits") == 0) {
+                 // A larger range makes rel_dist = E versus E-1 mistakes immediately visible.
+                 init_tensor_uniform(t, -1.0f, 1.0f);
+@@ -10970,6 +10991,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     }
+     // banded score-bias coverage: band edges, masks, decode offset, GQA, head sizes, table types
+     test_cases.emplace_back(new test_flash_attn_ext_banded( 64, 2, 1,  8,  8,   8, 1, GGML_TYPE_F32,  GGML_TYPE_F32));
++    // rel_idx (wrapped-cache positions): decode / split, prompt / tiled, Inkling-like SWA shapes
++    test_cases.emplace_back(new test_flash_attn_ext_banded(128, 32, 8,   1, 1536, 512, 2, GGML_TYPE_F16, GGML_TYPE_F32, false, true));
++    test_cases.emplace_back(new test_flash_attn_ext_banded(128, 32, 8,   4,  300,  64, 0, GGML_TYPE_F16, GGML_TYPE_F32, false, true));
++    test_cases.emplace_back(new test_flash_attn_ext_banded(128, 32, 8, 512, 1536, 512, 2, GGML_TYPE_F16, GGML_TYPE_F32, false, true));
++    test_cases.emplace_back(new test_flash_attn_ext_banded( 64,  8, 2,  37,  100,  16, 1, GGML_TYPE_BF16, GGML_TYPE_BF16, true, true));
+     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 2, 16, 16,   8, 1, GGML_TYPE_F16,  GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext_banded( 64, 8, 2,  1, 64,   8, 1, GGML_TYPE_F32,  GGML_TYPE_F32));
+     test_cases.emplace_back(new test_flash_attn_ext_banded(128, 8, 2, 64, 64,   8, 2, GGML_TYPE_BF16, GGML_TYPE_BF16));
+@@ -11196,6 +11222,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    // Local: Inkling-Small decode shapes only (256 experts, 6 used, d_model 4096, expert width 2048).
++    if (getenv("INKLING_PERF") != nullptr) {
++        for (ggml_type t : {GGML_TYPE_IQ2_S, GGML_TYPE_Q2_K, GGML_TYPE_IQ3_S, GGML_TYPE_Q3_K}) {
++            test_cases.emplace_back(new test_mul_mat_id_fusion(t, GGML_TYPE_F32, 256, 6, false, 2048, 1, 4096, 1)); // gate+up
++            test_cases.emplace_back(new test_mul_mat_id(t, GGML_TYPE_F32, 256, 6, false, 4096, 1, 2048));           // down
++        }
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 4096, 1, 4096, {1, 1}, {1, 1}));     // q / o
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 1024, 1, 4096, {1, 1}, {1, 1}));     // k / v
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 201024, 1, 4096, {1, 1}, {1, 1}));   // output head
++        return test_cases;
++    }
++
+     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
+     // note: same bytes either way, so a backend that indexes them differently shows it here
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+-- 
+2.55.0
+

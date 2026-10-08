@@ -1,0 +1,35 @@
+From c02c84201967931c5ee802faeef0e9a7a8b3a596 Mon Sep 17 00:00:00 2001
+From: mark <30506876+markhuguet@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 10:49:39 -0400
+Subject: [PATCH 07/15] fattn-banded: split-K from 64 keys (env
+ GGML_CUDA_BANDED_SPLIT_MIN)
+
+With the 1024 threshold, decode between 256 and 1023 cached keys used the one-warp kernel:
+gfx1151 tg64 @d256 13.3 -> 17.0, @d512 10.5 -> 16.6, @d0 and @d1024 unchanged.
+---
+ ggml/src/ggml-cuda/fattn-banded.cu | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/fattn-banded.cu b/ggml/src/ggml-cuda/fattn-banded.cu
+index 7088d9a45..045eea23f 100644
+--- a/ggml/src/ggml-cuda/fattn-banded.cu
++++ b/ggml/src/ggml-cuda/fattn-banded.cu
+@@ -421,10 +421,13 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
+ 
+     // Few query rows (decode, small speculative batches): split the key range so the GPU has enough warps.
+     // GGML_CUDA_BANDED_NO_SPLIT=1 restores the one-warp-per-row kernel for A/B checks.
+-    static const bool no_split = getenv("GGML_CUDA_BANDED_NO_SPLIT") != nullptr;
++    // GGML_CUDA_BANDED_SPLIT_MIN sets the smallest n_kv that takes the split path (default 64; at 1024 decode
++    // at depth 512 fell to 10.5 t/s vs 16.6, gfx1151).
++    static const bool    no_split  = getenv("GGML_CUDA_BANDED_NO_SPLIT") != nullptr;
++    static const int64_t split_min = getenv("GGML_CUDA_BANDED_SPLIT_MIN") ? atoll(getenv("GGML_CUDA_BANDED_SPLIT_MIN")) : 64;
+     const int64_t n_rows = q->ne[1]*q->ne[2]*q->ne[3];
+     const int64_t n_kv   = k->ne[1];
+-    if (!no_split && q->ne[1] <= 8 && n_kv >= 1024) {
++    if (!no_split && q->ne[1] <= 8 && n_kv >= split_min) {
+         constexpr int64_t target_warps = 2048;
+         const int64_t max_split = (n_kv + 127) / 128;
+         const int n_split = (int) std::max<int64_t>(1, std::min<int64_t>({(target_warps + n_rows - 1) / n_rows, max_split, 256}));
+-- 
+2.55.0
+

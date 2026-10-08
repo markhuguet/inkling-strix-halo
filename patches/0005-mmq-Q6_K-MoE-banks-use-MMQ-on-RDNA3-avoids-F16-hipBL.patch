@@ -1,0 +1,46 @@
+From ebd2465a76bbf81babbd2343e154c9f3b2f431c0 Mon Sep 17 00:00:00 2001
+From: mark <30506876+markhuguet@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 09:27:37 -0400
+Subject: [PATCH 05/15] mmq: Q6_K MoE banks use MMQ on RDNA3 (avoids F16
+ hipBLAS overflow and host sync)
+
+Replaces the blanket F32-output change (reverted): Inkling-Small's 2-expert shared bank is Q6_K, so
+at ubatch 512 it fell to the sorted hipBLAS MUL_MAT_ID path whose F16 output overflowed.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 4 +---
+ ggml/src/ggml-cuda/mmq.cu       | 4 +++-
+ 2 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index aa88d54f9..423ffd352 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1513,9 +1513,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+     const int cc = ggml_cuda_info().devices[ctx.device].cc;
+     bool prefer_f32_output = false;
+     if (compute_type == GGML_TYPE_F16) {
+-        // RDNA3/3.5 too: with F16 output a model whose activations reach ~1e3+ (Inkling-Small's shared-expert
+-        // down projection) overflows to inf during prompt processing and every later token is NaN.
+-        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_CDNA(cc);
++        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
+     } else if (compute_type == GGML_TYPE_BF16) {
+         prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
+     }
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index b13b34ee9..fc71a3b17 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -368,7 +368,9 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
+                 case GGML_TYPE_Q2_K:
+                     return ne11 <= 128;
+                 case GGML_TYPE_Q6_K:
+-                    return ne11 <= (GGML_CUDA_CC_IS_RDNA3_0(cc) ? 128 : 256);
++                    // MoE banks (even small shared-expert banks) take MMQ: the hipBLAS MUL_MAT_ID fallback syncs to
++                    // the host per ubatch and its F16 output overflows on Inkling-Small's shared-expert down projection.
++                    return n_experts > 0 || ne11 <= (GGML_CUDA_CC_IS_RDNA3_0(cc) ? 128 : 256);
+                 case GGML_TYPE_IQ2_XS:
+                 case GGML_TYPE_IQ2_S:
+                     return GGML_CUDA_CC_IS_RDNA3_5(cc) || ne11 <= 128;
+-- 
+2.55.0
+

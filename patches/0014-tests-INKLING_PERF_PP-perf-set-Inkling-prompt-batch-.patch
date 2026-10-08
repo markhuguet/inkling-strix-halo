@@ -1,0 +1,36 @@
+From 9b0e1b60086be13ddfb07f173b1dc29fae6c3993 Mon Sep 17 00:00:00 2001
+From: mark <30506876+markhuguet@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 19:29:52 -0400
+Subject: [PATCH 14/15] tests: INKLING_PERF_PP perf set (Inkling prompt-batch
+ matmul shapes)
+
+---
+ tests/test-backend-ops.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 71cc96dc7..92eb74126 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11234,6 +11234,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         return test_cases;
+     }
+ 
++    // Local: Inkling-Small prompt-batch shapes (ubatch 512): routed experts, shared bank, dense Q6_K projections.
++    if (getenv("INKLING_PERF_PP") != nullptr) {
++        const int64_t nt = 512;
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_S, GGML_TYPE_F32, 256, 6, false, 2048, nt, 4096)); // gate / up
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S, GGML_TYPE_F32, 256, 6, false, 4096, nt, 2048)); // down
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K,  GGML_TYPE_F32,   2, 2, false, 2048, nt, 4096)); // shexp gate/up
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K,  GGML_TYPE_F32,   2, 2, false, 4096, nt, 2048)); // shexp down
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 4096, nt, 4096, {1, 1}, {1, 1}));     // q / o
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 1024, nt, 4096, {1, 1}, {1, 1}));     // k / v
++        return test_cases;
++    }
++
+     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
+     // note: same bytes either way, so a backend that indexes them differently shows it here
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+-- 
+2.55.0
+

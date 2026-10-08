@@ -1,0 +1,32 @@
+From aa29189cdf312741b6e1279cf570ac81d8d37939 Mon Sep 17 00:00:00 2001
+From: mark <30506876+markhuguet@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 01:06:58 -0400
+Subject: [PATCH 04/15] cuda/hip: F32 output for F16 batched BLAS GEMMs on
+ RDNA3/3.5
+
+With F16 output, Inkling-Small's shared-expert down projection (outputs ~1e3) overflows to
+inf during prompt processing on gfx1151; RMS_NORM then yields NaN and every sampled token
+is '?'. Found with llama-eval-callback on a 7.1K-token prompt (first inf: MUL_MAT_ID of
+blk.34.ffn_down_shexp). RDNA4/Volta/CDNA already take this path.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 423ffd352..aa88d54f9 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1513,7 +1513,9 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+     const int cc = ggml_cuda_info().devices[ctx.device].cc;
+     bool prefer_f32_output = false;
+     if (compute_type == GGML_TYPE_F16) {
+-        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_CDNA(cc);
++        // RDNA3/3.5 too: with F16 output a model whose activations reach ~1e3+ (Inkling-Small's shared-expert
++        // down projection) overflows to inf during prompt processing and every later token is NaN.
++        prefer_f32_output = cc == GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_RDNA4(cc) || GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_CDNA(cc);
+     } else if (compute_type == GGML_TYPE_BF16) {
+         prefer_f32_output = !GGML_CUDA_CC_IS_RDNA3(cc) && !GGML_CUDA_CC_IS_CDNA(cc);
+     }
+-- 
+2.55.0
+

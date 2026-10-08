@@ -1,0 +1,29 @@
+From fc5fa78c64a38f6c6c6f1f8385dc42e516735ada Mon Sep 17 00:00:00 2001
+From: mark <30506876+markhuguet@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 23:06:47 -0400
+Subject: [PATCH 02/15] local: drop AMD WMMA banded gate (no RDNA3.5 device
+ code for the needed MMA instance)
+
+---
+ ggml/src/ggml-cuda/fattn.cu | 5 +----
+ 1 file changed, 1 insertion(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index 323bf0ef7..262fb5c7a 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -555,10 +555,7 @@ bool ggml_cuda_flash_attn_ext_banded_use_mma(const int device, const ggml_tensor
+         return false;
+     }
+ 
+-    // RDNA3/3.5/4 WMMA builds of the MMA kernel carry the same rel_f bias path; without this,
+-    // AMD falls back to the scalar per-query banded kernel, which is O(n_kv) serial per row.
+-    const int cc = ggml_cuda_info().devices[device].cc;
+-    return turing_mma_available(cc) || amd_wmma_available(cc);
++    return turing_mma_available(ggml_cuda_info().devices[device].cc);
+ }
+ 
+ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+-- 
+2.55.0
+

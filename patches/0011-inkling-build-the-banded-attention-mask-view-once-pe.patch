@@ -1,0 +1,49 @@
+From 336ddd729af3556967234dd83125e396fc2c135e Mon Sep 17 00:00:00 2001
+From: mark <30506876+markhuguet@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 14:25:16 -0400
+Subject: [PATCH 11/15] inkling: build the banded attention mask view once per
+ cache type, skip the copy when it is the whole mask
+
+The mask view was ggml_cont'ed in every layer: launches/token 2440 -> 2357 (copyBuffer 233 -> 153).
+gfx1151 tg64 19.55 -> 20.26, @1K 16.16 -> 16.71 t/s; greedy output byte-identical.
+---
+ src/models/inkling.cpp | 16 ++++++++++++----
+ 1 file changed, 12 insertions(+), 4 deletions(-)
+
+diff --git a/src/models/inkling.cpp b/src/models/inkling.cpp
+index c17166aab..9f8953107 100644
+--- a/src/models/inkling.cpp
++++ b/src/models/inkling.cpp
+@@ -375,6 +375,9 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+         return ggml_reshape_2d(ctx0, y, w, n_seq_tokens*n_seqs);
+     };
+ 
++    // the banded mask view is the same for every layer of a cache type: build (and copy) it once per type
++    ggml_tensor * mask_fa_cached[2] = { nullptr, nullptr };
++
+     auto build_attn_block = [&](ggml_tensor * cur, int il) -> ggml_tensor * {
+         const auto & layer = model.layers[il];
+ 
+@@ -499,10 +502,15 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+ 
+             ggml_tensor * rel_fa = ggml_reshape_4d(ctx0, rel,
+                     rel_extent, n_head, n_tokens/n_stream, n_stream);
+-            ggml_tensor * mask = is_swa ? inp_attn->get_kq_mask_swa() : inp_attn->get_kq_mask();
+-            mask = ggml_cont(ctx0, ggml_view_4d(ctx0, mask,
+-                    n_kv_flash, mask->ne[1], mask->ne[2], mask->ne[3],
+-                    mask->nb[1], mask->nb[2], mask->nb[3], 0));
++            ggml_tensor *& mask_fa = mask_fa_cached[is_swa ? 1 : 0];
++            if (mask_fa == nullptr || mask_fa->ne[0] != n_kv_flash) {
++                ggml_tensor * mask = is_swa ? inp_attn->get_kq_mask_swa() : inp_attn->get_kq_mask();
++                mask_fa = mask->ne[0] == n_kv_flash && ggml_is_contiguous(mask) ? mask :
++                    ggml_cont(ctx0, ggml_view_4d(ctx0, mask,
++                        n_kv_flash, mask->ne[1], mask->ne[2], mask->ne[3],
++                        mask->nb[1], mask->nb[2], mask->nb[3], 0));
++            }
++            ggml_tensor * mask = mask_fa;
+ 
+             cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, mask, rel_fa,
+                     1.0f/float(head_dim), rel_extent);
+-- 
+2.55.0
+

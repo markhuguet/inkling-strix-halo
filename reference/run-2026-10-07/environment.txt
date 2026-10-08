@@ -1,0 +1,14 @@
+date: 2026-10-07T21:08:26-04:00
+kernel: 7.2.7-200.fc44.x86_64
+cmdline: BOOT_IMAGE=(hd0,gpt2)/vmlinuz-7.2.7-200.fc44.x86_64 root=UUID=<redacted> ro rootflags=subvol=root rhgb quiet amd_iommu=off amdgpu.gttsize=126976 ttm.pages_limit=32505856 ttm.page_pool_size=32505856 rd.driver.blacklist=nouveau rd.driver.blacklist=nova-core
+llama.cpp tree: 84dae4c38d6c6b6fc5f4ac5404e37b7990971403
+image: 3599f7d877d5276de679cb363d14a3e627518969640c57c5ee7fdd173e064b1d
+tuned: throughput-performance
+platform_profile: performance
+/sys/class/thermal/thermal_zone0/temp: 84 C
+/sys/class/thermal/thermal_zone1/temp: 25 C
+/sys/class/thermal/thermal_zone2/temp: 40 C
+/sys/class/thermal/thermal_zone3/temp: 71 C
+/sys/class/thermal/thermal_zone4/temp: 35 C
+/sys/class/thermal/thermal_zone5/temp: 63 C
+/sys/class/thermal/thermal_zone6/temp: 30 C

@@ -1,0 +1,89 @@
+From 8979a4acccfd5bb65baeabf5a23fdc4b2cedef60 Mon Sep 17 00:00:00 2001
+From: mark <30506876+markhuguet@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 09:45:01 -0400
+Subject: [PATCH 01/15] local: rocm host-buffer workaround (#25992) + banded FA
+ MMA path on AMD WMMA
+
+---
+ ggml/src/ggml-cuda/fattn.cu     |  5 ++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu | 27 +++++++++++++++++++++++++--
+ 2 files changed, 29 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/fattn.cu b/ggml/src/ggml-cuda/fattn.cu
+index 262fb5c7a..323bf0ef7 100644
+--- a/ggml/src/ggml-cuda/fattn.cu
++++ b/ggml/src/ggml-cuda/fattn.cu
+@@ -555,7 +555,10 @@ bool ggml_cuda_flash_attn_ext_banded_use_mma(const int device, const ggml_tensor
+         return false;
+     }
+ 
+-    return turing_mma_available(ggml_cuda_info().devices[device].cc);
++    // RDNA3/3.5/4 WMMA builds of the MMA kernel carry the same rel_f bias path; without this,
++    // AMD falls back to the scalar per-query banded kernel, which is O(n_kv) serial per row.
++    const int cc = ggml_cuda_info().devices[device].cc;
++    return turing_mma_available(cc) || amd_wmma_available(cc);
+ }
+ 
+ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const ggml_tensor * dst) {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 2a247d447..423ffd352 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5071,6 +5071,22 @@ static enum ggml_backend_dev_type ggml_backend_cuda_device_get_type(ggml_backend
+         : GGML_BACKEND_DEVICE_TYPE_GPU;
+ }
+ 
++static bool ggml_backend_cuda_host_buffer_supported() {
++    return getenv("GGML_CUDA_NO_PINNED") == nullptr;
++}
++
++static bool ggml_backend_cuda_device_supports_cuda_host_buft(int device) {
++#if defined(GGML_USE_HIP)
++    if (ggml_cuda_info().devices[device].integrated) {
++        return false;
++    }
++#else
++    GGML_UNUSED(device);
++#endif
++
++    return ggml_backend_cuda_host_buffer_supported();
++}
++
+ static void ggml_backend_cuda_device_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
+     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
+ 
+@@ -5080,7 +5096,7 @@ static void ggml_backend_cuda_device_get_props(ggml_backend_dev_t dev, ggml_back
+     props->device_id   = ctx->pci_bus_id.empty() ? nullptr : ctx->pci_bus_id.c_str();
+     ggml_backend_cuda_device_get_memory(dev, &props->memory_free, &props->memory_total);
+ 
+-    bool host_buffer = getenv("GGML_CUDA_NO_PINNED") == nullptr;
++    bool host_buffer = ggml_backend_cuda_host_buffer_supported();
+ #ifdef GGML_CUDA_NO_PEER_COPY
+     bool events = false;
+ #else
+@@ -5109,6 +5125,10 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_buffer_type(ggml_
+ 
+ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(ggml_backend_dev_t dev) {
+     GGML_UNUSED(dev);
++    if (!ggml_backend_cuda_host_buffer_supported()) {
++        return nullptr;
++    }
++
+     return ggml_backend_cuda_host_buffer_type();
+ }
+ 
+@@ -5576,7 +5596,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+ static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
+-    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft));
++    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) ||
++        (integrated &&
++         ggml_backend_buft_is_cuda_host(buft) &&
++         ggml_backend_cuda_device_supports_cuda_host_buft(dev_ctx->device));
+ }
+ 
+ static int64_t get_op_batch_size(const ggml_tensor * op) {
+-- 
+2.55.0
+

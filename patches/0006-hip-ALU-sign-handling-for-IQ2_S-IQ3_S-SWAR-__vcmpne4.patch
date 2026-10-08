@@ -1,0 +1,167 @@
+From 76ec4e32a856da1baba877ff5ad24a5bcb10a7bb Mon Sep 17 00:00:00 2001
+From: mark <30506876+markhuguet@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 03:55:38 -0400
+Subject: [PATCH 06/15] hip: ALU sign handling for IQ2_S/IQ3_S, SWAR
+ __vcmpne4/__vcmpeq4
+
+On HIP __vcmpne4 was a per-byte loop and __vsub4 an emulated saturating subtract. IQ2_S/IQ3_S
+(mmvq vec_dot and MMQ tile loaders) now build sign masks with one multiply and apply them with an
+add (exact: no grid byte is zero). __vcmpne4/__vcmpeq4 use a SWAR zero-byte test for all callers.
+gfx1151, Inkling-Small shapes: IQ2_S fused gate+up 148 -> 73 us, IQ3_S down 161 -> 84 us;
+llama-bench tg64 17.2 -> 18.5-18.8 t/s, pp512 211 -> 245 t/s. test-backend-ops: 1166/1166 pass.
+---
+ ggml/src/ggml-cuda/mmq-load-tiles.cuh | 16 +++++++++++++++
+ ggml/src/ggml-cuda/vecdotq.cuh        | 29 +++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/vendors/hip.h      | 28 ++++++++------------------
+ 3 files changed, 53 insertions(+), 20 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmq-load-tiles.cuh b/ggml/src/ggml-cuda/mmq-load-tiles.cuh
+index 7f00bad94..49ccc1a7b 100644
+--- a/ggml/src/ggml-cuda/mmq-load-tiles.cuh
++++ b/ggml/src/ggml-cuda/mmq-load-tiles.cuh
+@@ -1265,11 +1265,19 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+         for (int l = 0; l < QR2_S; ++l) {
+             const int * grid_pos = (const int *)(iq2s_grid + (qs[l] | ((qh << (8-2*l)) & 0x300)));
+ 
++#if defined(GGML_USE_HIP)
++            const int signs0 = iq_sign_mask4(signs_packed_8[l] & 0x0F);
++            const int signs1 = iq_sign_mask4(signs_packed_8[l] >> 4);
++
++            const int grid_l = iq_apply_signs(grid_pos[0], signs0);
++            const int grid_h = iq_apply_signs(grid_pos[1], signs1);
++#else
+             const int signs0 = __vcmpne4(((signs_packed_8[l] & 0x03) << 7) | ((signs_packed_8[l] & 0x0C) << 21), 0x00000000);
+             const int signs1 = __vcmpne4(((signs_packed_8[l] & 0x30) << 3) | ((signs_packed_8[l] & 0xC0) << 17), 0x00000000);
+ 
+             const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
+             const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
++#endif // defined(GGML_USE_HIP)
+ 
+ #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+             x_qs[i*sram_stride + 8*kqsx + (2*l + 0)] = grid_l;
+@@ -1400,11 +1408,19 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+                 iq3s_grid[qs[2*l+0] | ((qh << (8 - 2*l)) & 0x100)],
+                 iq3s_grid[qs[2*l+1] | ((qh << (7 - 2*l)) & 0x100)]);
+ 
++#if defined(GGML_USE_HIP)
++            const int signs0 = iq_sign_mask4(signs_packed_8[l] & 0x0F);
++            const int signs1 = iq_sign_mask4(signs_packed_8[l] >> 4);
++
++            const int grid_l = iq_apply_signs(grid_pos.x, signs0);
++            const int grid_h = iq_apply_signs(grid_pos.y, signs1);
++#else
+             const int signs0 = __vcmpne4(((signs_packed_8[l] & 0x03) << 7) | ((signs_packed_8[l] & 0x0C) << 21), 0x00000000);
+             const int signs1 = __vcmpne4(((signs_packed_8[l] & 0x30) << 3) | ((signs_packed_8[l] & 0xC0) << 17), 0x00000000);
+ 
+             const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+             const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
++#endif // defined(GGML_USE_HIP)
+ 
+ #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+             x_qs[i*sram_stride + 8*kqsx + (2*l+0)] = grid_l;
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index f2a6f2009..de0cc1652 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -1118,6 +1118,19 @@ static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(
+     return d * sumi;
+ }
+ 
++// Sign handling for the IQ2_S / IQ3_S grids. On HIP, __vcmpne4 is a per-byte loop and __vsub4 an emulated saturating
++// byte subtract; these two helpers compute the same values with plain 32-bit ALU ops.
++// iq_sign_mask4: bits 0..3 of b4 -> bytes 0..3 set to 0xFF/0x00 (the bit positions never overlap, so nothing carries).
++// iq_apply_signs: per byte, -g where the mask is 0xFF, else g. Exact because every iq2s_grid/iq3s_grid byte is
++// non-zero (~g + 1 never carries into the next byte); matches __vsub4(g ^ m, m) for these grids.
++static __device__ __forceinline__ int iq_sign_mask4(const uint32_t b4) {
++    return (int) (((b4 * 0x00204081u) & 0x01010101u) * 0xFFu);
++}
++
++static __device__ __forceinline__ int iq_apply_signs(const int g, const int m) {
++    return (g ^ m) + (m & 0x01010101);
++}
++
+ #define VDR_IQ2_S_Q8_1_MMVQ 2
+ #define VDR_IQ2_S_Q8_1_MMQ  2
+ 
+@@ -1143,11 +1156,19 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
+     for (int l0 = 0; l0 < 8; l0 += 2) {
+         const int * grid_pos = (const int *)(iq2s_grid + (qs[l0/2] | ((qh << (8-l0)) & 0x300)));
+ 
++#if defined(GGML_USE_HIP)
++        const int signs0 = iq_sign_mask4(signs_packed_8[l0/2] & 0x0F);
++        const int signs1 = iq_sign_mask4(signs_packed_8[l0/2] >> 4);
++
++        const int grid_l = iq_apply_signs(grid_pos[0], signs0);
++        const int grid_h = iq_apply_signs(grid_pos[1], signs1);
++#else
+         const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
+         const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
+ 
+         const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
+         const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
++#endif // defined(GGML_USE_HIP)
+ 
+         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+@@ -1228,11 +1249,19 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
+             iq3s_grid[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)],
+             iq3s_grid[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+ 
++#if defined(GGML_USE_HIP)
++        const int signs0 = iq_sign_mask4(signs_packed_8[l0/2] & 0x0F);
++        const int signs1 = iq_sign_mask4(signs_packed_8[l0/2] >> 4);
++
++        const int grid_l = iq_apply_signs(grid_pos.x, signs0);
++        const int grid_h = iq_apply_signs(grid_pos.y, signs1);
++#else
+         const int signs0 = __vcmpne4(((signs_packed_8[l0/2] & 0x03) << 7) | ((signs_packed_8[l0/2] & 0x0C) << 21), 0x00000000);
+         const int signs1 = __vcmpne4(((signs_packed_8[l0/2] & 0x30) << 3) | ((signs_packed_8[l0/2] & 0xC0) << 17), 0x00000000);
+ 
+         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+         const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
++#endif // defined(GGML_USE_HIP)
+ 
+         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
+         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
+diff --git a/ggml/src/ggml-cuda/vendors/hip.h b/ggml/src/ggml-cuda/vendors/hip.h
+index 48d4eb2ce..bb78bc4d6 100644
+--- a/ggml/src/ggml-cuda/vendors/hip.h
++++ b/ggml/src/ggml-cuda/vendors/hip.h
+@@ -280,26 +280,14 @@ static __device__ __forceinline__ int __vsub4(const int a, const int b) {
+     return __vsubss4(a, b);
+ }
+ 
+-static __device__ __forceinline__ unsigned int __vcmpeq4(unsigned int a, unsigned int b) {
+-    const uint8x4_t& va = reinterpret_cast<const uint8x4_t&>(a);
+-    const uint8x4_t& vb = reinterpret_cast<const uint8x4_t&>(b);
+-    unsigned int c;
+-    uint8x4_t& vc = reinterpret_cast<uint8x4_t&>(c);
+-#pragma unroll
+-    for (int i = 0; i < 4; ++i) {
+-        vc[i] = va[i] == vb[i] ? 0xff : 0x00;
+-    }
+-    return c;
++// Byte-wise compares without a per-byte loop (SWAR): a byte of x = a ^ b is non-zero iff bit 7 of
++// ((x & 0x7F) + 0x7F) | x is set; the masked add never carries out of its byte. Exact for all inputs.
++static __device__ __forceinline__ unsigned int __vcmpne4(unsigned int a, unsigned int b) {
++    const unsigned int x = a ^ b;
++    const unsigned int hi = (((x & 0x7F7F7F7Fu) + 0x7F7F7F7Fu) | x) & 0x80808080u;
++    return (hi >> 7) * 0xFFu;
+ }
+ 
+-static __device__ __forceinline__ unsigned int __vcmpne4(unsigned int a, unsigned int b) {
+-    const uint8x4_t& va = reinterpret_cast<const uint8x4_t&>(a);
+-    const uint8x4_t& vb = reinterpret_cast<const uint8x4_t&>(b);
+-    unsigned int c;
+-    uint8x4_t& vc = reinterpret_cast<uint8x4_t&>(c);
+-#pragma unroll
+-    for (int i = 0; i < 4; ++i) {
+-        vc[i] = va[i] == vb[i] ? 0x00 : 0xff;
+-    }
+-    return c;
++static __device__ __forceinline__ unsigned int __vcmpeq4(unsigned int a, unsigned int b) {
++    return ~__vcmpne4(a, b);
+ }
+-- 
+2.55.0
+

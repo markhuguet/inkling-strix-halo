@@ -1,0 +1,157 @@
+From fcde5daaf6bd74bd8d399ece87cb53736e5c0c0c Mon Sep 17 00:00:00 2001
+From: mark <30506876+markhuguet@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 14:37:45 -0400
+Subject: [PATCH 12/15] cuda/hip: reuse mmvq's quantized src1 across matvecs
+ reading the same tensor
+
+Fixed 1 MiB buffer in the context (allocated once outside capture, never reallocated), keyed by src1
+data/ne/nb, invalidated at graph start and when any node writes over the cached src1. Inkling decode:
+quantize_q8_1 415 -> 249 launches/token, tg64 20.16 -> 20.49 t/s; output byte-identical.
+GGML_CUDA_NO_Q8_REUSE=1 disables it.
+---
+ ggml/src/ggml-cuda/common.cuh    | 26 ++++++++++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu  | 12 +++++++++++
+ ggml/src/ggml-cuda/mmvq.cu       | 34 +++++++++++++++++++++++++++++---
+ ggml/src/ggml-cuda/vendors/hip.h |  3 +++
+ 4 files changed, 72 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 2e78ae4fa..323fcd78e 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1464,6 +1464,32 @@ struct ggml_backend_cuda_context {
+ 
+     int curr_stream_no = 0;
+ 
++    // Reuse of mmvq's quantized src1 across consecutive matvecs that read the same tensor (q/k/v/r projections,
++    // routed + shared experts). One fixed buffer, allocated once outside graph capture and never reallocated, so
++    // captured graphs stay valid. Invalidated at graph start and whenever a node writes over the cached src1.
++    struct mmvq_q8_cache_t {
++        const void * src1_data   = nullptr;
++        int64_t      ne[4]       = {0, 0, 0, 0};
++        size_t       nb[4]       = {0, 0, 0, 0};
++        size_t       src1_nbytes = 0;
++        void *       buf         = nullptr;
++        size_t       cap         = 0;
++        bool         valid       = false;
++    } mmvq_q8_cache;
++
++    void mmvq_q8_cache_note_write(const ggml_tensor * t) {
++        if (!mmvq_q8_cache.valid || t->data == nullptr) {
++            return;
++        }
++        const char * a0 = (const char *) t->data;
++        const char * a1 = a0 + ggml_nbytes(t);
++        const char * b0 = (const char *) mmvq_q8_cache.src1_data;
++        const char * b1 = b0 + mmvq_q8_cache.src1_nbytes;
++        if (a0 < b1 && b0 < a1) {
++            mmvq_q8_cache.valid = false;
++        }
++    }
++
+ #ifdef USE_CUDA_GRAPH
+     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
+     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 28615cef2..0db5a10da 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -706,6 +706,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+     if (copy_event != nullptr) {
+         CUDA_CHECK(cudaEventDestroy(copy_event));
+     }
++    if (mmvq_q8_cache.buf != nullptr) {
++        ggml_cuda_set_device(device);
++        CUDA_CHECK(cudaFree(mmvq_q8_cache.buf));
++    }
+     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+             if (streams[i][j] != nullptr) {
+@@ -4331,6 +4335,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+     bool graph_evaluated_or_captured = false;
+ 
++    // quantized src1 from a previous graph is never reused
++    cuda_ctx->mmvq_q8_cache.valid = false;
++
+     // flag used to determine whether it is an integrated_gpu
+     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
+ 
+@@ -4469,6 +4476,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 }
+ 
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
++                for (int j = i; j <= i + nodes_to_skip; ++j) {
++                    if (!ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
++                        cuda_ctx->mmvq_q8_cache_note_write(cgraph->nodes[j]);
++                    }
++                }
+ 
+                 if (nodes_to_skip != 0) {
+ #ifdef GGML_CUDA_DEBUG
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 96c3f1e87..2b8f9c8bf 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1498,13 +1498,41 @@ void ggml_cuda_mul_mat_vec_q(
+     }
+ 
+     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+-    {
++    const size_t  q8_size     = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
++
++    // reuse the quantized src1 of the previous matvec when it read the same tensor (see mmvq_q8_cache_t)
++    static const bool no_q8_reuse = getenv("GGML_CUDA_NO_Q8_REUSE") != nullptr;
++    constexpr size_t q8_cache_cap = 1u << 20;
++    auto & qc = ctx.mmvq_q8_cache;
++    const bool can_cache = !no_q8_reuse && ctx.curr_stream_no == 0 && q8_size <= q8_cache_cap;
++    if (can_cache && qc.buf == nullptr) {
++        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
++        CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
++        if (capture_status == cudaStreamCaptureStatusNone) {
++            CUDA_CHECK(cudaMalloc(&qc.buf, q8_cache_cap));
++            qc.cap = q8_cache_cap;
++        }
++    }
++    const bool use_cache = can_cache && qc.buf != nullptr;
++    const bool hit = use_cache && qc.valid && qc.src1_data == src1->data &&
++        memcmp(qc.ne, src1->ne, sizeof(qc.ne)) == 0 && memcmp(qc.nb, src1->nb, sizeof(qc.nb)) == 0;
++
++    ggml_cuda_pool_alloc<char> src1_q8_pool(ctx.pool());
++    char * src1_q8_1_ptr = use_cache ? (char *) qc.buf : src1_q8_pool.alloc(q8_size);
++    if (!hit) {
+         const int64_t s11 = src1->nb[1] / ts_src1;
+         const int64_t s12 = src1->nb[2] / ts_src1;
+         const int64_t s13 = src1->nb[3] / ts_src1;
+-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_ptr, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++        if (use_cache) {
++            qc.src1_data   = src1->data;
++            memcpy(qc.ne, src1->ne, sizeof(qc.ne));
++            memcpy(qc.nb, src1->nb, sizeof(qc.nb));
++            qc.src1_nbytes = ggml_nbytes(src1);
++            qc.valid       = true;
++        }
+     }
++    struct { char * p; char * get() const { return p; } } src1_q8_1 { src1_q8_1_ptr };
+ 
+     const int64_t s01 = src0->nb[1] / ts_src0;
+     const int64_t s11 = ne10_padded / QK8_1;
+diff --git a/ggml/src/ggml-cuda/vendors/hip.h b/ggml/src/ggml-cuda/vendors/hip.h
+index bb78bc4d6..35fdfe81d 100644
+--- a/ggml/src/ggml-cuda/vendors/hip.h
++++ b/ggml/src/ggml-cuda/vendors/hip.h
+@@ -134,6 +134,9 @@
+ #define cudaGraphNodeTypeKernel hipGraphNodeTypeKernel
+ #define cudaGraphInstantiate hipGraphInstantiate
+ #define cudaStreamEndCapture hipStreamEndCapture
++#define cudaStreamIsCapturing hipStreamIsCapturing
++#define cudaStreamCaptureStatus hipStreamCaptureStatus
++#define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
+ #define cudaGraphDestroy hipGraphDestroy
+ #define cudaGraphKernelNodeSetParams hipGraphKernelNodeSetParams
+ #define cudaErrorInvalidDeviceFunction hipErrorInvalidDeviceFunction
+-- 
+2.55.0
+
