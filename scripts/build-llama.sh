@@ -4,7 +4,7 @@
 set -euo pipefail
 source "$(dirname "$0")/lib.sh"
 [ -d "$SRC/.git" ] || die "no llama.cpp checkout at $SRC (run scripts/fetch-llama.sh)"
-TARGETS="${TARGETS:-llama-server llama-bench llama-perplexity llama-cli test-backend-ops}"
+TARGETS="${TARGETS:-llama-server llama-bench llama-perplexity llama-cli llama-imatrix llama-quantize test-backend-ops}"
 log "building $TARGETS in $SRC/$BUILD"
 in_container -v "$SRC":/src -w /src -- bash -euc "
   [ -f $BUILD/build.ninja ] || cmake -S . -B $BUILD -G Ninja \

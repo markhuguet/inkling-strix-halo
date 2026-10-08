@@ -34,6 +34,46 @@ degraded with context.
 | conv-state rollback | 0015 | n-gram code edit 70 → 78; makes MTP viable |
 | MTP heads (n-gram + MTP) | 0015 | prose decode +4%, code edit 80 |
 
+## Decode round 2 (2026-10-08)
+
+**Floor.** A decoded token reads 6.12 GiB of weights. That is 32–35 tok/s at a realistic 210–230 GB/s, against
+20.4 measured. The PMC profile showed that the large matvecs were already at 195–247 GB/s. The gap was ~1,450 small
+kernel launches per token at ~6–7 µs each.
+
+**Trunk requant (default since this round).** The Q6_K trunk tensors (attention, shared experts, dense FFN) were
+requantized with an importance matrix computed from the downloaded model. The 287 tensors moved are listed in
+`work/trunk-quant/types-*.txt`, and the experts stay byte-identical. Recipe: `scripts/make-trunk-quant.sh`.
+
+| trunk | tg64 @0 | tg64 @4K | server decode | KLD vs f32 CPU ref | same top token |
+|---|---|---|---|---|---|
+| Q6_K (download) | 19.6 | 16.1 | 17.6 | 0.168 | 88.6% |
+| **Q5_K (default)** | 20.9 | 17.0 | 18.3 | 0.208 | 86.4% |
+| Q4_K | 21.8 | 17.8 | 19.2 | 0.284 | 83.7% |
+
+Both requants keep the code edit exact. Q5_K adds about +0.04 KLD, Q4_K about +0.12. `TRUNK_TYPE=q4_K` or `none`
+selects the others.
+
+**Fusion (patch 0016).** Dispatches per token went 2192 → 1438. On the Q5_K trunk, tg64 went 21.1 → 22.7 at 0
+(+7.7%) and 17.3 → 18.4 at 4K (+6.4%); server decode went 18.3 → 19.7. Decode output is bit-identical except for
+the routing math, whose KLD is unchanged (0.164 vs 0.168).
+
+**Matvec launch shape (rejected).** gfx1151 used the RDNA2 mmvq table, which gives 1 warp per block. A dedicated
+RDNA3.5 table was swept, and every setting landed within ±1%; 2–4 warps for the IQ types was worse. The remaining
+expert-kernel headroom is ~3%.
+
+**Where the time goes now** (per token): matvecs ~29 ms, at 190–220 GB/s. The remaining small kernels are:
+
+| kernel | count per token | time |
+|---|---|---|
+| quantize_q8_1 | 249 | 1.7 ms |
+| rms_norm | 170 | 1.4 ms |
+| short conv | 168 | 1.3 ms |
+| bin_bcast (adds, muls) | 139 | 1.0 ms |
+| set_rows | 84 | 0.6 ms |
+
+The F32 router matvec is another 1.4 ms, at only ~120 GB/s. The GPU also runs at ~2.4 GHz of its 2.9 GHz maximum
+during decode.
+
 ## Tried and rejected (measured, no gain)
 
 - **HIP graphs** (patch 0009, opt-in `LLAMA_INKLING_PAD_KV=1`): graphs replay correctly, but on ROCm 7.14 replaying

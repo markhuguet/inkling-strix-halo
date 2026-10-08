@@ -8,19 +8,20 @@ On the reference machine (HP ZBook Ultra G1a, AC power, `throughput-performance`
 
 | | PR #25731 alone¹ | this repo |
 |---|---|---|
-| decode, short context (llama-bench tg64) | 17.2 tok/s | **20.4 tok/s** |
-| decode at 16K context | 3.4 tok/s | **14.5 tok/s** |
-| prefill, pp512 / at 8K context | 211 / 122 tok/s | **275 / 189 tok/s** |
-| server prefill, 9.8K-token prompt | 153 tok/s | **226 tok/s** |
-| follow-up turn in a 9.8K conversation (TTFT) | 5.7 s | **3.4 s** |
-| server decode / copy-heavy code edit (n-gram drafting) | 14.6 / 9.4 tok/s (no drafting) | **17.7 / 75 tok/s** |
+| decode, short context (llama-bench tg64) | 17.2 tok/s | **23.1 tok/s** |
+| decode at 16K context | 3.4 tok/s | **16.4 tok/s** |
+| prefill, pp512 / at 8K context | 211 / 122 tok/s | **297 / 204 tok/s** |
+| server prefill, 9.8K-token prompt | 153 tok/s | **248 tok/s** |
+| follow-up turn in a 9.8K conversation (TTFT) | 5.7 s | **3.1 s** |
+| server decode / copy-heavy code edit (n-gram drafting) | 14.6 / 9.4 tok/s (no drafting) | **20.7 / 83 tok/s** |
 | long prompts (> ~4.6K tokens) | intermittently only `?` | correct |
 
 ¹ PR #25731 plus the ROCm host-buffer fix it needs to load, same power profile, measured 2026-10-05.
-Model: Unsloth `UD-IQ3_XXS` (97.9 GB), 196K-token context, thinking off. The full reference run, with all logs, is in
-[reference/run-2026-10-07/](reference/run-2026-10-07/summary.md).
+Model: Unsloth `UD-IQ3_XXS` (97.9 GB); this repo serves it with its trunk requantized to Q5_K (`make trunk`, see
+below). 196K-token context, thinking off. The full reference run, with all logs, is in
+[reference/run-2026-10-08/](reference/run-2026-10-08/summary.md).
 
-The patches make decode **~4x faster at long context** than the open Inkling PR (#25731) alone, and fix an overflow that
+The patches make decode **~5x faster at long context** than the open Inkling PR (#25731) alone, and fix an overflow that
 made long prompts return only `?`.
 [docs/RESULTS.md](docs/RESULTS.md) has the step-by-step history, and [docs/PATCHES.md](docs/PATCHES.md) explains each patch.
 
@@ -31,14 +32,15 @@ made long prompts return only `?`.
   `amdgpu.gttsize=126976 ttm.pages_limit=32505856 ttm.page_pool_size=32505856`.
   See [docs/SETUP.md](docs/SETUP.md).
 - podman and git. Everything else (ROCm, compilers, Python) is inside the container.
-- ~115 GB of disk on a fast local SSD.
+- ~210 GB of disk on a fast local SSD: the 98 GB download plus the ~91 GB Q5_K-trunk model built from it (plus ~2.5 GB
+  for MTP on btrfs/xfs, which reflink).
 
 ## Quick start
 
 ```bash
 git clone https://github.com/markhuguet/inkling-strix-halo.git && cd inkling-strix-halo
 scripts/check-host.sh           # PASS/WARN/FAIL for every prerequisite
-make all                        # image -> llama.cpp source -> build -> 103 GB of weights -> MTP GGUF
+make all                        # image -> source -> build -> 103 GB download -> Q5_K-trunk model -> MTP GGUF
 make serve                      # http://127.0.0.1:8732  (OpenAI-compatible API + web UI)
 ```
 
@@ -50,15 +52,21 @@ make serve                      # http://127.0.0.1:8732  (OpenAI-compatible API 
 | `make source` | `scripts/fetch-llama.sh` | upstream llama.cpp @ `7ab4ee7ba` + PR #25731 + 15 patches; **checks the git tree hash** | <1 min |
 | `make build` | `scripts/build-llama.sh` | HIP Release build in the container | ~10 min |
 | `make weights` | `scripts/download-model.sh` | pinned HF revisions; **checks sha256** of every file | network |
+| `make trunk` | `scripts/make-trunk-quant.sh` | builds the served model: the download's Q6_K trunk requantized to Q5_K with an importance matrix (experts unchanged); **checks sha256** | ~15 min |
 | `make mtp` | `scripts/make-mtp-gguf.sh` | adds the 8 MTP layers as a 4th GGUF shard; **checks sha256** (the conversion is deterministic) | ~3 min |
 
 Weights go to `~/models/Inkling-Small-GGUF`. Set `MODELS=/elsewhere` to change it, e.g. `make MODELS=/data/inkling all`.
+
+The served model is `UD-IQ3_XXS-trunk-q5_K`: the downloaded GGUF with its trunk (attention, shared experts, dense FFN)
+at Q5_K instead of Q6_K. That reads 8% fewer bytes per token, for +4–6% decode, at a small quality cost (KLD +0.04;
+see [docs/RESULTS.md](docs/RESULTS.md#decode-round-2-2026-10-08)). Set `TRUNK_TYPE=none` to serve the download
+unchanged, or `TRUNK_TYPE=q4_K` for a further +4% at a larger cost.
 
 ## Serving
 
 ```bash
 make serve                  # PROFILE=default: n-gram speculative drafting
-make serve-mtp              # PROFILE=mtp: n-gram first, then the model's MTP head (+4% on prose)
+make serve-mtp              # PROFILE=mtp: n-gram first, then the MTP head (slower than default since 2026-10-08)
 SLOTS=4 make serve          # 4 concurrent requests (~38 tok/s aggregate); adds --kv-unified automatically
 CTX=65536 make serve        # smaller KV cache (default 196,608 tokens, ~6 GiB)
 TEMPLATE_KWARGS='{"reasoning_effort":"low"}' make serve   # thinking on (default: none)
@@ -103,47 +111,49 @@ How to read the verdicts:
 
 To run only some parts: `STEPS="bench server" PROFILES=default bench/run-all.sh`.
 
-## Performance test (2026-10-07)
+## Performance test (2026-10-08)
 
-`make bench` was run a second time on the reference machine, from the repo's own build. That's a full independent
-rerun: AC power, `throughput-performance`, cool start. **All 33 metrics reproduced the reference**: every speed was
-within ±2%, except MTP-profile prefill at −6 to −8% (still inside the 10% tolerance). Greedy outputs were
-byte-identical.
+This is the current reference: a full `make bench` on the reference machine, using the repo's own build. It ran on AC
+power with `throughput-performance` and the Q5_K-trunk model. The machine was warm (73 °C), so a cool start may
+be a little faster.
 
 **Server** (`bench/server_suite.py`, temperature 0, 196K context):
 
 | | default profile (n-gram) | MTP profile (n-gram + MTP) |
 |---|---|---|
-| decode, 256 tokens | 17.6 tok/s | 17.8 tok/s (44% of drafts accepted) |
-| 400-token story | 17.4 tok/s | 17.7 tok/s (45% accepted) |
-| code edit, 1,373 tokens | 75.3 tok/s, output exactly correct | 74.8 tok/s, output exactly correct |
-| prefill, 2.4K-token prompt | 252 tok/s | 213 tok/s |
-| prefill, 9.8K-token prompt | 225 tok/s | 204 tok/s |
-| follow-up turn in a 9.8K conversation (TTFT) | 3.4 s | 3.7 s |
+| decode, 256 tokens | **20.7 tok/s** | 18.5 tok/s (45% of drafts accepted) |
+| 400-token story | 20.2 tok/s | 20.6 tok/s (49% accepted) |
+| code edit, 1,373 tokens | **82.9 tok/s**, output exactly correct | 80.7 tok/s, output exactly correct |
+| prefill, 2.4K-token prompt | **280 tok/s** | 254 tok/s |
+| prefill, 9.8K-token prompt | **248 tok/s** | 238 tok/s |
+| follow-up turn in a 9.8K conversation (TTFT) | **3.1 s** | 4.1 s |
 
 **Engine** (llama-bench, 3 repetitions):
 
 | | short context | 1K | 8K | 16K |
 |---|---|---|---|---|
-| decode (tg64) | 20.4 tok/s | 17.0 | — | 14.8 |
-| prefill (pp512) | 273 tok/s | — | 187 | — |
+| decode (tg64) | 23.1 tok/s | 19.1 | — | 16.4 |
+| prefill (pp512) | 297 tok/s | — | 204 | — |
 
 **Correctness:**
 
-- `test-backend-ops`, GPU vs CPU: 2,504 / 2,504 tests pass (FLASH_ATTN_EXT_BANDED, SSM_CONV, MUL_MAT, MUL_MAT_ID, GET_ROWS).
-- MTP head, teacher-forced agreement with the target's greedy token: depth 0 36%, depths 1-2 about 2%.
+- `test-backend-ops`, GPU vs CPU: 2,582 / 2,582 tests pass (FLASH_ATTN_EXT_BANDED, SSM_CONV, MOE_ROUTE, OUT_PROD,
+  MUL_MAT, MUL_MAT_ID, GET_ROWS).
+- MTP head, teacher-forced agreement with the target's greedy token: depth 0 35%, depths 1-2 about 2-3%.
 
-**Takeaway:** the MTP profile gains only +1-2% on decode, and it makes prompt processing 10-15% slower. For
-long-prompt or agent work, the default profile is the better choice.
+**Takeaway:** use the default profile. With the faster decode, the MTP profile no longer pays: it is 10% slower on
+decode, prefills more slowly, and has a slower follow-up TTFT.
 
-Full results: [reference/rerun-2026-10-07/summary.md](reference/rerun-2026-10-07/summary.md).
+**Compared with 2026-10-07** (Q6_K trunk, before patch 0016): server decode 17.7 → 20.7 (+17%), tg64 20.4 → 23.1
+(+13%), prefill at 9.8K 226 → 248. That run is kept in [reference/run-2026-10-07/](reference/run-2026-10-07/summary.md)
+and [reference/rerun-2026-10-07/](reference/rerun-2026-10-07/summary.md).
 
 ## Repository layout
 
 ```
 versions.env          every pinned input: llama.cpp commits + expected tree hashes, ROCm tarball, HF revisions
 container/            Containerfile (Fedora 44 + TheRock ROCm 7.14.0)
-patches/              0000 = PR #25731 squashed; 0001-0015 = the local patch series (git am)
+patches/              0000 = PR #25731 squashed; 0001-0016 = the local patch series (git am)
 scripts/              host check, image, source, build, weights, MTP GGUF, serve
 tools/convert_mtp.py  mtp.safetensors -> 4th GGUF shard
 bench/                run-all.sh, llama_bench.sh, test_ops.sh, mtp_check.sh, server_suite.py, compare.py, data/
@@ -160,6 +170,8 @@ docs/                 SETUP (host), PATCHES (what/why), RESULTS (history, reject
 - **Multiple slots require `--kv-unified`** (added automatically). Batched decode produces different text than single
   requests, which is normal.
 - **MTP helps little with a 3-bit target** (~36-43% depth-0 agreement). See [docs/MTP.md](docs/MTP.md).
+- **The Q5_K-trunk model is bit-reproducible only if the imatrix run is.** Its sha256 is pinned in `reference/`.
+  A mismatch on other hardware still gives an equivalent model; check it with KLD.
 - **Capability results are not reproducible from this repo.** The fixture corpus was built from private code.
 
 ## Troubleshooting

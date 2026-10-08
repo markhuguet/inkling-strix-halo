@@ -32,8 +32,8 @@ PY' _ "$repo" "$rev" "$dir" "$@"
 if verify 'UD-IQ3_XXS/|mmproj'; then
   log "base GGUF already present and verified"
 else
-  log "downloading $GGUF_REPO@${GGUF_REV:0:9}: $QUANT + mmproj (~98 GB)"
-  inhibit fetch "$GGUF_REPO" "$GGUF_REV" "" "$QUANT/*" "mmproj-F16.gguf"
+  log "downloading $GGUF_REPO@${GGUF_REV:0:9}: $BASE_QUANT + mmproj (~98 GB)"
+  inhibit fetch "$GGUF_REPO" "$GGUF_REV" "" "$BASE_QUANT/*" "mmproj-F16.gguf"
   verify 'UD-IQ3_XXS/|mmproj' || die "checksum mismatch in the base GGUF"
 fi
 

@@ -1,0 +1,796 @@
+From a53208d81466f854fa5c91545ab02e62517b50d0 Mon Sep 17 00:00:00 2001
+From: mark <30506876+markhuguet@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 00:16:30 -0400
+Subject: [PATCH] inkling: fused MoE routing op, residual add folded into the
+ short-conv fusion, fewer decode launches
+
+- GGML_OP_MOE_ROUTE (ggml_moe_route_ids / ggml_moe_route_weights): top-k(sigmoid + bias) expert ids and the
+  normalized sigmoid weights of the selected + shared experts (CPU + CUDA/HIP; ids and weights in one launch when
+  adjacent). Replaces ~14 routing ops per MoE layer. LLAMA_INKLING_NO_MOE_ROUTE=1 builds the old op chain.
+- rel-position bias via out_prod: no per-token transposed copy of attn_rel_proj (bit-identical).
+- CUDA/HIP sconv fusion also folds the following residual ADD (GGML_CUDA_DISABLE_SCONV_RESIDUAL_FUSION=1 to turn
+  off), and refuses to fuse when the output overlaps the state/kernel/cache it reads across channels.
+- shared-expert down-proj views are created before the adds so the add chain fuses.
+- test-backend-ops: MOE_ROUTE cases (per op and whole graph).
+
+Decode dispatches/token 2192 -> 1438; tg64 +7.7% @0, +6.4% @4K (Q5_K trunk); decode output bit-identical except
+the routing math (KLD vs f32 CPU ref 0.164 vs 0.168).
+---
+ ggml/include/ggml.h              |  23 ++++++
+ ggml/src/ggml-cpu/ggml-cpu.c     |   5 ++
+ ggml/src/ggml-cpu/ops.cpp        |  68 ++++++++++++++++
+ ggml/src/ggml-cpu/ops.h          |   1 +
+ ggml/src/ggml-cuda/ggml-cuda.cu  |  60 ++++++++++++++
+ ggml/src/ggml-cuda/moe-route.cu  | 136 +++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/moe-route.cuh |   5 ++
+ ggml/src/ggml-cuda/ssm-conv.cu   |   9 +-
+ ggml/src/ggml-cuda/ssm-conv.cuh  |   3 +
+ ggml/src/ggml.c                  |  62 +++++++++++++-
+ src/models/inkling.cpp           |  99 ++++++++++++++--------
+ tests/test-backend-ops.cpp       |  48 +++++++++++
+ 12 files changed, 480 insertions(+), 39 deletions(-)
+ create mode 100644 ggml/src/ggml-cuda/moe-route.cu
+ create mode 100644 ggml/src/ggml-cuda/moe-route.cuh
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 2b52f77c4..ba20b9379 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -590,6 +590,7 @@ extern "C" {
+         GGML_OP_DSV4_HC_COMB,
+         GGML_OP_DSV4_HC_PRE,
+         GGML_OP_DSV4_HC_POST,
++        GGML_OP_MOE_ROUTE,
+ 
+         GGML_OP_UNARY,
+ 
+@@ -2472,6 +2473,28 @@ extern "C" {
+             struct ggml_tensor  * a,
+             int                   k);
+ 
++    // MoE routing by sigmoid scores (Inkling). logits: F32 {n_expert + n_shared, n_tokens}, routed experts first.
++    // ggml_moe_route_ids:     experts = top-k(sigmoid(logits[:n_expert]) + bias), I32 {k, n_tokens}, best first.
++    //                         bias: F32 {n_expert} (selection only).
++    // ggml_moe_route_weights: w = sigmoid([logits[ids], logits[n_expert:]]) / sum(...) * scale * gscale[0]
++    //                         over the k selected and the n_shared trailing (shared-expert) logits. The result is F32
++    //                         {k*n_tokens + n_shared*n_tokens} in two contiguous planes: the routed weights {k, n_tokens},
++    //                         then the shared weights {n_shared, n_tokens}; view each plane with ggml_view_*.
++    GGML_API struct ggml_tensor * ggml_moe_route_ids(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * logits,
++            struct ggml_tensor  * bias,
++            int                   n_expert,
++            int                   k);
++
++    GGML_API struct ggml_tensor * ggml_moe_route_weights(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * logits,
++            struct ggml_tensor  * ids,
++            struct ggml_tensor  * gscale,
++            int                   n_expert,
++            float                 scale);
++
+     GGML_API struct ggml_tensor * ggml_arange(
+             struct ggml_context * ctx,
+             float                 start,
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index a057d6e72..86a28425d 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2018,6 +2018,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_top_k(params, tensor);
+             } break;
++        case GGML_OP_MOE_ROUTE:
++            {
++                ggml_compute_forward_moe_route(params, tensor);
++            } break;
+         case GGML_OP_LEAKY_RELU:
+             {
+                 ggml_compute_forward_leaky_relu(params, tensor);
+@@ -2430,6 +2434,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_TIMESTEP_EMBEDDING:
+         case GGML_OP_ARGSORT:
+         case GGML_OP_TOP_K:
++        case GGML_OP_MOE_ROUTE:
+         case GGML_OP_FLASH_ATTN_EXT:
+         case GGML_OP_FLASH_ATTN_EXT_BANDED:
+         case GGML_OP_FLASH_ATTN_BACK:
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index dd063c6b4..fb902083c 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -8595,6 +8595,74 @@ static void ggml_compute_forward_top_k_f32(
+     }
+ }
+ 
++// ggml_compute_forward_moe_route
++
++static inline float ggml_moe_route_sigmoid(float x) {
++    return 1.0f/(1.0f + expf(-x));
++}
++
++void ggml_compute_forward_moe_route(
++    const ggml_compute_params * params,
++    ggml_tensor * dst) {
++
++    const ggml_tensor * logits = dst->src[0];
++    GGML_ASSERT(logits->type == GGML_TYPE_F32 && logits->nb[0] == sizeof(float));
++
++    const int32_t mode     = ggml_get_op_params_i32(dst, 0);
++    const int32_t n_expert = ggml_get_op_params_i32(dst, 1);
++    const int32_t k        = ggml_get_op_params_i32(dst, 2);
++    const float   scale    = ggml_get_op_params_f32(dst, 3);
++
++    const int64_t n_tokens = logits->ne[1];
++    const int64_t n_shared = logits->ne[0] - n_expert;
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    std::vector<std::pair<float, int32_t>> scores(n_expert);
++
++    for (int64_t t = ith; t < n_tokens; t += nth) {
++        const float * l = (const float *) ((const char *) logits->data + t*logits->nb[1]);
++        if (mode == 0) {
++            const float * bias = (const float *) dst->src[1]->data;
++            for (int32_t e = 0; e < n_expert; ++e) {
++                scores[e] = { ggml_moe_route_sigmoid(l[e]) + bias[e], e };
++            }
++            // best first; ties keep the lower expert index
++            std::partial_sort(scores.begin(), scores.begin() + k, scores.end(),
++                    [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) {
++                        return a.first > b.first || (a.first == b.first && a.second < b.second);
++                    });
++            int32_t * out = (int32_t *) ((char *) dst->data + t*dst->nb[1]);
++            for (int32_t i = 0; i < k; ++i) {
++                out[i] = scores[i].second;
++            }
++        } else {
++            const ggml_tensor * ids = dst->src[1];
++            const float gscale = ((const float *) dst->src[2]->data)[0];
++            const int32_t * id = (const int32_t *) ((const char *) ids->data + t*ids->nb[1]);
++            float * w_routed = (float *) dst->data + t*k;
++            float * w_shared = (float *) dst->data + n_tokens*k + t*n_shared;
++            float sum = 0.0f;
++            for (int32_t i = 0; i < k; ++i) {
++                w_routed[i] = ggml_moe_route_sigmoid(l[id[i]]);
++                sum += w_routed[i];
++            }
++            for (int64_t s = 0; s < n_shared; ++s) {
++                w_shared[s] = ggml_moe_route_sigmoid(l[n_expert + s]);
++                sum += w_shared[s];
++            }
++            const float f = scale*gscale/sum;
++            for (int32_t i = 0; i < k; ++i) {
++                w_routed[i] *= f;
++            }
++            for (int64_t s = 0; s < n_shared; ++s) {
++                w_shared[s] *= f;
++            }
++        }
++    }
++}
++
+ void ggml_compute_forward_top_k(
+     const ggml_compute_params * params,
+     ggml_tensor * dst) {
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index 2728b08b6..0306ae0d8 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -83,6 +83,7 @@ void ggml_compute_forward_arange(const struct ggml_compute_params * params, stru
+ void ggml_compute_forward_timestep_embedding(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_argsort(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_top_k(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_moe_route(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_leaky_relu(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_tri(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_fill(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 0db5a10da..beb0e8ffc 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -53,6 +53,7 @@
+ #include "ggml-cuda/sum.cuh"
+ #include "ggml-cuda/sumrows.cuh"
+ #include "ggml-cuda/top-k.cuh"
++#include "ggml-cuda/moe-route.cuh"
+ #include "ggml-cuda/mean.cuh"
+ #include "ggml-cuda/tsembd.cuh"
+ #include "ggml-cuda/topk-moe.cuh"
+@@ -2414,6 +2415,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_TOP_K:
+             ggml_cuda_op_top_k(ctx, dst);
+             break;
++        case GGML_OP_MOE_ROUTE:
++            ggml_cuda_op_moe_route(ctx, dst);
++            break;
+         case GGML_OP_ARGSORT:
+             ggml_cuda_op_argsort(ctx, dst);
+             break;
+@@ -2888,6 +2892,42 @@ static int ggml_cuda_try_sconv_fusion(const ggml_cgraph * cgraph, int node_idx,
+     }
+ 
+     f.concat = concat; f.cpy_dst = cpy->src[1]; f.ssm_conv = conv; f.add = add; f.x = add->src[0];
++
++    // fold a following residual ADD(res, reshape/view of add) when the add has no other consumer
++    static const bool no_res = getenv("GGML_CUDA_DISABLE_SCONV_RESIDUAL_FUSION") != nullptr;
++    int add_idx = last;
++    if (!no_res && !(add->flags & GGML_TENSOR_FLAG_OUTPUT) && ggml_node_get_use_count(cgraph, add_idx) == 1) {
++        for (int j = last + 1; j < cgraph->n_nodes && j <= last + 4; ++j) {
++            ggml_tensor * n = cgraph->nodes[j];
++            if (ggml_cuda_is_view_or_noop(n)) {
++                // only the add's own reshape/view may sit in between, used once
++                if (n->view_src != add || ggml_node_get_use_count(cgraph, j) != 1 || !ggml_is_contiguous(n) ||
++                        !ggml_is_contiguous(add)) {
++                    break;
++                }
++                continue;
++            }
++            if (n->op == GGML_OP_ADD && n->type == GGML_TYPE_F32 && n->src[1] && n->src[1]->view_src == add &&
++                    n->src[1]->view_offs == 0 && ggml_nelements(n) == ggml_nelements(add) &&
++                    ggml_is_contiguous(n) && ggml_is_contiguous(n->src[0]) && n->src[0]->type == GGML_TYPE_F32 &&
++                    ggml_nelements(n->src[0]) == ggml_nelements(add) && n->src[0]->data != add->data) {
++                f.res_add = n; f.res = n->src[0];
++                last = j;
++            }
++            break;
++        }
++    }
++    // the kernel reads state/kernel and writes the cache and the output from different threads: the output may
++    // alias x and the residual element for element, but must not overlap anything read across channels
++    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
++        const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
++        const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
++        return a0 < b1 && b0 < a1;
++    };
++    const ggml_tensor * out = f.res_add ? f.res_add : add;
++    if (overlaps(out, state) || overlaps(out, conv->src[1]) || overlaps(out, f.cpy_dst) || overlaps(f.cpy_dst, xt)) {
++        return 0;
++    }
+     return last - node_idx;
+ }
+ 
+@@ -3590,6 +3630,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+     }
+ 
++    // moe_route ids -> moe_route weights of the same logits: one launch (views/no-ops in between are skipped)
++    if (node->op == GGML_OP_MOE_ROUTE && ggml_get_op_params_i32(node, 0) == 0) {
++        for (int j = i + 1; j < cgraph->n_nodes && j <= i + 8; ++j) {
++            ggml_tensor * n = cgraph->nodes[j];
++            if (ggml_cuda_is_view_or_noop(n)) {
++                continue;
++            }
++            if (n->op == GGML_OP_MOE_ROUTE && ggml_get_op_params_i32(n, 0) == 1 && n->src[1] == node &&
++                    n->src[0] == node->src[0]) {
++                ggml_cuda_op_moe_route(*cuda_ctx, node, n);
++                return j - i;
++            }
++            break;
++        }
++    }
++
+     // concat(state, x^T) -> cpy(state tail -> cache) -> ssm_conv -> add(x, conv): Inkling's short conv, few tokens
+     if (node->op == GGML_OP_CONCAT) {
+         ggml_cuda_sconv_fusion f;
+@@ -5635,6 +5691,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+             return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+         case GGML_OP_SUM:
+             return ggml_is_contiguous_rows(op->src[0]);
++        case GGML_OP_MOE_ROUTE:
++            return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->nb[0] == sizeof(float) &&
++                   ggml_get_op_params_i32(op, 2) <= 16 && op->src[0]->ne[0] - ggml_get_op_params_i32(op, 1) <= 8 &&
++                   ggml_get_op_params_i32(op, 1)*sizeof(float) <= 48*1024;
+         case GGML_OP_TOP_K:
+ #if defined(GGML_USE_HIP) || defined(GGML_CUDA_USE_CUB)
+             return true;
+diff --git a/ggml/src/ggml-cuda/moe-route.cu b/ggml/src/ggml-cuda/moe-route.cu
+new file mode 100644
+index 000000000..dfec782cd
+--- /dev/null
++++ b/ggml/src/ggml-cuda/moe-route.cu
+@@ -0,0 +1,136 @@
++#include "moe-route.cuh"
++
++#include <climits>
++
++#define MOE_ROUTE_BLOCK 256
++#define MOE_ROUTE_MAX_K 16
++
++static __device__ __forceinline__ float moe_route_sigmoid(float x) {
++    return 1.0f/(1.0f + expf(-x));
++}
++
++// (score, index) is better if the score is larger, ties go to the lower index (matches the CPU partial_sort)
++static __device__ __forceinline__ bool moe_route_better(float sa, int ia, float sb, int ib) {
++    return sa > sb || (sa == sb && ia < ib);
++}
++
++// ids mode: write ids (I32 {k, n_tokens}) from top-k(sigmoid(l) + bias), unless ids_in is given (weights-only mode).
++// weights (optional): two planes, routed {k, n_tokens} then shared {n_shared, n_tokens}.
++static __global__ void moe_route_kernel(
++        const float * __restrict__ logits, const int64_t logits_stride,
++        const float * __restrict__ bias,
++        const int32_t * __restrict__ ids_in, const int64_t ids_in_stride,
++        int32_t * __restrict__ ids_out, const int64_t ids_out_stride,
++        float * __restrict__ weights, const float * __restrict__ gscale, const float scale,
++        const int n_expert, const int n_shared, const int k, const int64_t n_tokens) {
++    const int64_t t   = blockIdx.x;
++    const int     tid = threadIdx.x;
++    const float * l   = logits + t*logits_stride;
++
++    __shared__ float   s_score[MOE_ROUTE_BLOCK];
++    __shared__ int     s_index[MOE_ROUTE_BLOCK];
++    __shared__ int32_t s_sel[MOE_ROUTE_MAX_K];
++
++    if (ids_in) {
++        if (tid < k) {
++            s_sel[tid] = ids_in[t*ids_in_stride + tid];
++        }
++    } else {
++        extern __shared__ float scores[]; // n_expert
++        for (int e = tid; e < n_expert; e += blockDim.x) {
++            scores[e] = moe_route_sigmoid(l[e]) + bias[e];
++        }
++        __syncthreads();
++
++        for (int i = 0; i < k; ++i) {
++            float best = -INFINITY;
++            int   bidx = INT_MAX;
++            for (int e = tid; e < n_expert; e += blockDim.x) {
++                if (moe_route_better(scores[e], e, best, bidx)) {
++                    best = scores[e];
++                    bidx = e;
++                }
++            }
++            s_score[tid] = best;
++            s_index[tid] = bidx;
++            __syncthreads();
++            for (int off = blockDim.x/2; off > 0; off >>= 1) {
++                if (tid < off && moe_route_better(s_score[tid + off], s_index[tid + off], s_score[tid], s_index[tid])) {
++                    s_score[tid] = s_score[tid + off];
++                    s_index[tid] = s_index[tid + off];
++                }
++                __syncthreads();
++            }
++            if (tid == 0) {
++                const int e = s_index[0];
++                s_sel[i]  = e;
++                scores[e] = -INFINITY;
++                ids_out[t*ids_out_stride + i] = e;
++            }
++            __syncthreads();
++        }
++    }
++    __syncthreads();
++
++    if (weights && tid == 0) {
++        float w[MOE_ROUTE_MAX_K + 8];
++        float sum = 0.0f;
++        for (int i = 0; i < k; ++i) {
++            w[i] = moe_route_sigmoid(l[s_sel[i]]);
++            sum += w[i];
++        }
++        float sh_sum = 0.0f;
++        for (int s = 0; s < n_shared; ++s) {
++            sh_sum += moe_route_sigmoid(l[n_expert + s]);
++        }
++        sum += sh_sum;
++        const float f = scale*gscale[0]/sum;
++        for (int i = 0; i < k; ++i) {
++            weights[t*k + i] = w[i]*f;
++        }
++        for (int s = 0; s < n_shared; ++s) {
++            weights[n_tokens*k + t*n_shared + s] = moe_route_sigmoid(l[n_expert + s])*f;
++        }
++    }
++}
++
++void ggml_cuda_op_moe_route(ggml_backend_cuda_context & ctx, ggml_tensor * ids_dst, ggml_tensor * weights_dst) {
++    // ids_dst may itself be a weights-mode node (then it is the only output)
++    ggml_tensor * w_node = weights_dst;
++    ggml_tensor * i_node = ids_dst;
++    if (ggml_get_op_params_i32(ids_dst, 0) == 1) {
++        GGML_ASSERT(weights_dst == nullptr);
++        w_node = ids_dst;
++        i_node = nullptr;
++    }
++    const ggml_tensor * any    = i_node ? i_node : w_node;
++    const ggml_tensor * logits = any->src[0];
++    GGML_ASSERT(logits->type == GGML_TYPE_F32 && logits->nb[0] == sizeof(float));
++
++    const int     n_expert = ggml_get_op_params_i32(any, 1);
++    const int     k        = ggml_get_op_params_i32(any, 2);
++    const int     n_shared = (int) (logits->ne[0] - n_expert);
++    const int64_t n_tokens = logits->ne[1];
++    GGML_ASSERT(k <= MOE_ROUTE_MAX_K && n_shared <= 8);
++
++    const float   * bias    = i_node ? (const float *) i_node->src[1]->data : nullptr;
++    int32_t       * ids_out = i_node ? (int32_t *) i_node->data : nullptr;
++    const int32_t * ids_in  = nullptr;
++    int64_t ids_in_stride   = 0;
++    if (!i_node) {
++        ids_in        = (const int32_t *) w_node->src[1]->data;
++        ids_in_stride = w_node->src[1]->nb[1]/sizeof(int32_t);
++    } else if (w_node) {
++        GGML_ASSERT(w_node->src[1] == i_node && w_node->src[0] == logits);
++    }
++    float       * weights = w_node ? (float *) w_node->data : nullptr;
++    const float * gscale  = w_node ? (const float *) w_node->src[2]->data : nullptr;
++    const float   scale   = w_node ? ggml_get_op_params_f32(w_node, 3) : 0.0f;
++
++    const size_t smem = ids_in ? 0 : n_expert*sizeof(float);
++    moe_route_kernel<<<n_tokens, MOE_ROUTE_BLOCK, smem, ctx.stream()>>>(
++        (const float *) logits->data, logits->nb[1]/sizeof(float), bias,
++        ids_in, ids_in_stride, ids_out, i_node ? i_node->nb[1]/sizeof(int32_t) : 0,
++        weights, gscale, scale, n_expert, n_shared, k, n_tokens);
++    CUDA_CHECK(cudaGetLastError());
++}
+diff --git a/ggml/src/ggml-cuda/moe-route.cuh b/ggml/src/ggml-cuda/moe-route.cuh
+new file mode 100644
+index 000000000..738478994
+--- /dev/null
++++ b/ggml/src/ggml-cuda/moe-route.cuh
+@@ -0,0 +1,5 @@
++#include "common.cuh"
++
++// GGML_OP_MOE_ROUTE (ggml_moe_route_ids / ggml_moe_route_weights): sigmoid-score MoE routing, one block per token.
++// weights_dst (optional) is a ggml_moe_route_weights node whose ids are ids_dst: both are computed in one launch.
++void ggml_cuda_op_moe_route(ggml_backend_cuda_context & ctx, ggml_tensor * ids_dst, ggml_tensor * weights_dst = nullptr);
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cu b/ggml/src/ggml-cuda/ssm-conv.cu
+index 907824ca9..08fbaf81c 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cu
++++ b/ggml/src/ggml-cuda/ssm-conv.cu
+@@ -212,6 +212,7 @@ static __global__ void sconv_fused_f32(
+         const char * __restrict__ wts,   int64_t w_nb1,                    // kernel {d_conv + 1, w}
+         char * __restrict__ y,           int64_t y_nb0,  int64_t y_nb1,   // add dst {w, n_t}
+         char * __restrict__ cache,       int64_t c_nb0,  int64_t c_nb1,   // new state {d_conv, w}
++        const char * __restrict__ res,   int64_t r_nb0,  int64_t r_nb1,   // optional residual {w, n_t}: y = res + add
+         const int n_t, const int64_t n_ch) {
+     const int64_t c = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+     if (c >= n_ch) {
+@@ -239,7 +240,8 @@ static __global__ void sconv_fused_f32(
+         for (int j = 0; j < K; ++j) {
+             sumf += sx[t + j] * w[j];
+         }
+-        *(float *) (y + c*y_nb0 + t*y_nb1) = sx[d_conv + t] + sumf;
++        const float out = sx[d_conv + t] + sumf;
++        *(float *) (y + c*y_nb0 + t*y_nb1) = res ? *(const float *) (res + c*r_nb0 + t*r_nb1) + out : out;
+     }
+ #pragma unroll
+     for (int i = 0; i < d_conv; ++i) {
+@@ -257,11 +259,14 @@ void ggml_cuda_op_sconv_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_s
+ 
+     const int threads = 256;
+     const dim3 blocks((n_ch + threads - 1) / threads, 1, 1);
++    // with a residual the result goes to the residual add's dst (same {w, n_t} layout as the add)
++    const ggml_tensor * out = f.res_add ? f.res_add : f.add;
+     sconv_fused_f32<3, 8><<<blocks, threads, 0, ctx.stream()>>>(
+         (const char *) state->data, state->nb[0], state->nb[1],
+         (const char *) f.x->data, f.x->nb[0], f.x->nb[1],
+         (const char *) wts->data, wts->nb[1],
+-        (char *) f.add->data, f.add->nb[0], f.add->nb[1],
++        (char *) out->data, out->nb[0], out->nb[1],
+         (char *) f.cpy_dst->data, f.cpy_dst->nb[0], f.cpy_dst->nb[1],
++        f.res ? (const char *) f.res->data : nullptr, f.res ? f.res->nb[0] : 0, f.res ? f.res->nb[1] : 0,
+         n_t, n_ch);
+ }
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cuh b/ggml/src/ggml-cuda/ssm-conv.cuh
+index 012965b8e..e2747e38a 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cuh
++++ b/ggml/src/ggml-cuda/ssm-conv.cuh
+@@ -11,6 +11,9 @@ struct ggml_cuda_sconv_fusion {
+     ggml_tensor * ssm_conv = nullptr; // {w, n_t}
+     ggml_tensor * add      = nullptr; // {w, n_t}
+     ggml_tensor * x        = nullptr; // add's other operand {w, n_t} (same data as concat->src[1])
++    // optional: the residual ADD(res, view(add)) that follows; then only res + add is written, to res_add
++    ggml_tensor * res_add  = nullptr;
++    ggml_tensor * res      = nullptr;
+ };
+ 
+ void ggml_cuda_op_sconv_fused(ggml_backend_cuda_context & ctx, const ggml_cuda_sconv_fusion & f);
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 392c34928..3f83d4721 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1085,6 +1085,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "DSV4_HC_COMB",
+     "DSV4_HC_PRE",
+     "DSV4_HC_POST",
++    "MOE_ROUTE",
+ 
+     "UNARY",
+ 
+@@ -1102,7 +1103,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "GLU",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
++static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1201,6 +1202,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "dsv4_hc_comb(mixes, scale, base)",
+     "dsv4_hc_pre(x, weights)",
+     "dsv4_hc_post(x, residual, post, comb)",
++    "moe_route(logits, x)",
+ 
+     "unary(x)",
+ 
+@@ -1218,7 +1220,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "glu(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
++static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -5473,6 +5475,62 @@ struct ggml_tensor * ggml_top_k(
+     return result;
+ }
+ 
++// ggml_moe_route_ids / ggml_moe_route_weights
++// op_params: 0 = mode (0: ids, 1: weights), 1 = n_expert, 2 = k, 3 = scale (f32)
++
++struct ggml_tensor * ggml_moe_route_ids(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * logits,
++        struct ggml_tensor  * bias,
++        int                   n_expert,
++        int                   k) {
++    GGML_ASSERT(logits->type == GGML_TYPE_F32 && bias->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_matrix(logits) && logits->ne[0] >= n_expert && n_expert >= k && k > 0);
++    GGML_ASSERT(ggml_nelements(bias) == n_expert && ggml_is_contiguous(bias));
++
++    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, k, logits->ne[1]);
++
++    ggml_set_op_params_i32(result, 0, 0);
++    ggml_set_op_params_i32(result, 1, n_expert);
++    ggml_set_op_params_i32(result, 2, k);
++    ggml_set_op_params_f32(result, 3, 0.0f);
++
++    result->op     = GGML_OP_MOE_ROUTE;
++    result->src[0] = logits;
++    result->src[1] = bias;
++
++    return result;
++}
++
++struct ggml_tensor * ggml_moe_route_weights(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * logits,
++        struct ggml_tensor  * ids,
++        struct ggml_tensor  * gscale,
++        int                   n_expert,
++        float                 scale) {
++    GGML_ASSERT(logits->type == GGML_TYPE_F32 && ids->type == GGML_TYPE_I32 && gscale->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_matrix(logits) && logits->ne[0] >= n_expert && ids->ne[1] == logits->ne[1]);
++    GGML_ASSERT(ggml_is_matrix(ids) && ids->nb[0] == sizeof(int32_t) && ggml_nelements(gscale) == 1);
++
++    const int64_t k        = ids->ne[0];
++    const int64_t n_shared = logits->ne[0] - n_expert;
++
++    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (k + n_shared)*logits->ne[1]);
++
++    ggml_set_op_params_i32(result, 0, 1);
++    ggml_set_op_params_i32(result, 1, n_expert);
++    ggml_set_op_params_i32(result, 2, (int32_t) k);
++    ggml_set_op_params_f32(result, 3, scale);
++
++    result->op     = GGML_OP_MOE_ROUTE;
++    result->src[0] = logits;
++    result->src[1] = ids;
++    result->src[2] = gscale;
++
++    return result;
++}
++
+ // ggml_arange
+ 
+ struct ggml_tensor * ggml_arange(
+diff --git a/src/models/inkling.cpp b/src/models/inkling.cpp
+index f9e7c1c1e..ef190cd1a 100644
+--- a/src/models/inkling.cpp
++++ b/src/models/inkling.cpp
+@@ -482,11 +482,8 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+         // relative position bias
+         ggml_tensor * r2 = ggml_reshape_2d(ctx0, r, d_rel, n_head*n_tokens);
+ 
+-        // proj stored [E, d_rel]; transpose so ggml_mul_mat contracts over d_rel
+-        ggml_tensor * proj = ggml_cont(ctx0, ggml_transpose(ctx0, layer.attn_rel_proj)); // {d_rel, E}
+-
+-        ggml_tensor * rel = ggml_mul_mat(ctx0, proj, r2); // {E, n_head*n_tokens}
+-        ggml_prec_set_acc(rel, GGML_PREC_F32_PEDANTIC);
++        // proj stored [E, d_rel]: out_prod contracts over its ne[1] directly (no per-token transposed copy of the weight)
++        ggml_tensor * rel = ggml_out_prod(ctx0, layer.attn_rel_proj, ggml_transpose(ctx0, r2)); // {E, n_head*n_tokens}
+         rel = ggml_reshape_3d(ctx0, rel, rel_extent, n_head, n_tokens);
+ 
+         if (tau && !is_swa) {
+@@ -648,6 +645,50 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+         return cur;
+     };
+ 
++    // experts given the routing: selected I32 {k, n_tokens}, weights {1, k, n_tokens}, shared gammas {1, n_shexp, n_tokens}
++    auto build_moe_experts = [&](ggml_tensor * cur, int il, ggml_tensor * selected, ggml_tensor * weights,
++            ggml_tensor * gammas) -> ggml_tensor * {
++        const auto & layer = model.layers[il];
++        const int64_t n_shexp = hparams.n_expert_shared;
++
++        ggml_tensor * xr   = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
++        ggml_tensor * gate = build_lora_mm_id(layer.ffn_gate_exps, xr, selected); // {n_ff_exp, n_expert_used, n_tokens}
++        ggml_tensor * up   = build_lora_mm_id(layer.ffn_up_exps,   xr, selected);
++        ggml_tensor * h    = ggml_swiglu_split(ctx0, gate, up);
++
++        ggml_tensor * experts = build_lora_mm_id(layer.ffn_down_exps, h, selected); // {n_embd, n_expert_used, n_tokens}
++        experts = ggml_mul(ctx0, experts, weights);
++
++        ggml_tensor * moe_out = nullptr;
++        for (int64_t i = 0; i < n_expert_used; ++i) {
++            ggml_tensor * e = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
++            moe_out = moe_out ? ggml_add(ctx0, moe_out, e) : e;
++        }
++
++        // shared experts: mul_mat_id with constant ids (never 2D-view a quantized/repacked weight)
++        GGML_ASSERT(shexp_idx != nullptr);
++        ggml_tensor * gs = build_lora_mm_id(layer.ffn_gate_shexp, xr, shexp_idx); // {n_ff_exp, n_shexp, n_tokens}
++        ggml_tensor * us = build_lora_mm_id(layer.ffn_up_shexp,   xr, shexp_idx);
++        ggml_tensor * hs = ggml_swiglu_split(ctx0, gs, us);
++
++        // gammas (shared-expert weights) must scale hs BEFORE the down-proj to match reference rounding in bf16/quant
++        hs = ggml_mul(ctx0, hs, gammas);
++        ggml_tensor * ds = build_lora_mm_id(layer.ffn_down_shexp, hs, shexp_idx); // {n_embd, n_shexp, n_tokens}
++
++        // views first, so the adds are adjacent graph nodes (backends fuse add chains)
++        std::vector<ggml_tensor *> ds_views;
++        for (int64_t s = 0; s < n_shexp; ++s) {
++            ds_views.push_back(ggml_view_2d(ctx0, ds, n_embd, n_tokens, ds->nb[2], s*ds->nb[1]));
++            ggml_build_forward_expand(gf, ds_views.back());
++        }
++        for (ggml_tensor * e : ds_views) {
++            moe_out = ggml_add(ctx0, moe_out, e);
++        }
++        cb(moe_out, "inkling_moe_out", il);
++
++        return moe_out;
++    };
++
+     // custom MoE routing (not expressible via build_moe_ffn): select by top-k(sigmoid(logits) + bias), weight by softmax(logsigmoid(raw logits)) * scales
+     auto build_moe = [&](ggml_tensor * cur, int il) -> ggml_tensor * {
+         const auto & layer = model.layers[il];
+@@ -658,6 +699,22 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+             layer.ffn_gate_inp, cur, nullptr, GGML_PREC_F32_PEDANTIC); // {n_expert + n_shexp, n_tokens}
+         cb(logits, "inkling_moe_logits", il);
+ 
++        // fused routing: 2 ops (CUDA/HIP: 1 launch) instead of ~14; LLAMA_INKLING_NO_MOE_ROUTE=1 builds the op-by-op graph
++        static const bool no_moe_route = getenv("LLAMA_INKLING_NO_MOE_ROUTE") != nullptr;
++        if (!no_moe_route) {
++            ggml_tensor * selected = ggml_moe_route_ids(ctx0, logits, layer.ffn_exp_probs_b, n_expert, n_expert_used);
++            cb(selected, "inkling_moe_topk", il);
++            ggml_tensor * w = ggml_moe_route_weights(ctx0, logits, selected, layer.ffn_gscale, n_expert,
++                    hparams.expert_weights_scale);
++            cb(w, "inkling_moe_weights", il);
++            ggml_build_forward_expand(gf, w); // right after the ids node, so backends can compute both in one launch
++            const size_t wsz = ggml_element_size(w);
++            ggml_tensor * weights = ggml_view_3d(ctx0, w, 1, n_expert_used, n_tokens, wsz, n_expert_used*wsz, 0);
++            ggml_tensor * gammas  = ggml_view_3d(ctx0, w, 1, n_shexp, n_tokens, wsz, n_shexp*wsz,
++                    n_expert_used*n_tokens*wsz);
++            return build_moe_experts(cur, il, selected, weights, gammas);
++        }
++
+         const size_t lsz = ggml_element_size(logits);
+ 
+         ggml_tensor * routed = ggml_cont(ctx0, ggml_view_2d(ctx0, logits, n_expert, n_tokens, logits->nb[1], 0));
+@@ -690,38 +747,10 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
+         ggml_tensor * weights = ggml_cont(ctx0, ggml_view_2d(ctx0, w, n_expert_used, n_tokens, w->nb[1], 0));
+         weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
+ 
+-        ggml_tensor * xr   = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+-        ggml_tensor * gate = build_lora_mm_id(layer.ffn_gate_exps, xr, selected); // {n_ff_exp, n_expert_used, n_tokens}
+-        ggml_tensor * up   = build_lora_mm_id(layer.ffn_up_exps,   xr, selected);
+-        ggml_tensor * h    = ggml_swiglu_split(ctx0, gate, up);
+-
+-        ggml_tensor * experts = build_lora_mm_id(layer.ffn_down_exps, h, selected); // {n_embd, n_expert_used, n_tokens}
+-        experts = ggml_mul(ctx0, experts, weights);
+-
+-        ggml_tensor * moe_out = nullptr;
+-        for (int64_t i = 0; i < n_expert_used; ++i) {
+-            ggml_tensor * e = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
+-            moe_out = moe_out ? ggml_add(ctx0, moe_out, e) : e;
+-        }
+-
+-        // shared experts: mul_mat_id with constant ids (never 2D-view a quantized/repacked weight)
+-        GGML_ASSERT(shexp_idx != nullptr);
+-        ggml_tensor * gs = build_lora_mm_id(layer.ffn_gate_shexp, xr, shexp_idx); // {n_ff_exp, n_shexp, n_tokens}
+-        ggml_tensor * us = build_lora_mm_id(layer.ffn_up_shexp,   xr, shexp_idx);
+-        ggml_tensor * hs = ggml_swiglu_split(ctx0, gs, us);
+-
+-        // gammas (last n_shexp weight rows) must scale hs BEFORE the down-proj to match reference rounding in bf16/quant
+         ggml_tensor * gammas = ggml_cont(ctx0, ggml_view_2d(ctx0, w, n_shexp, n_tokens, w->nb[1], n_expert_used*wsz));
+-        hs = ggml_mul(ctx0, hs, ggml_reshape_3d(ctx0, gammas, 1, n_shexp, n_tokens));
+-        ggml_tensor * ds = build_lora_mm_id(layer.ffn_down_shexp, hs, shexp_idx); // {n_embd, n_shexp, n_tokens}
+-
+-        for (int64_t s = 0; s < n_shexp; ++s) {
+-            ggml_tensor * e = ggml_view_2d(ctx0, ds, n_embd, n_tokens, ds->nb[2], s*ds->nb[1]);
+-            moe_out = ggml_add(ctx0, moe_out, e);
+-        }
+-        cb(moe_out, "inkling_moe_out", il);
++        gammas = ggml_reshape_3d(ctx0, gammas, 1, n_shexp, n_tokens);
+ 
+-        return moe_out;
++        return build_moe_experts(cur, il, selected, weights, gammas);
+     };
+ 
+     ggml_tensor * cur = nullptr;
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 92eb74126..e2c537584 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -6558,6 +6558,47 @@ struct test_argsort : public test_case {
+ };
+ 
+ // GGML_OP_TOP_K
++// GGML_OP_MOE_ROUTE: ids (top-k of sigmoid + bias) and weights (normalized sigmoid of selected + shared logits)
++struct test_moe_route : public test_case {
++    const int n_expert;
++    const int n_shared;
++    const int k;
++    const int n_tokens;
++    const bool whole; // whole graph: ids -> weights, lets backends fuse the two
++
++    std::string vars() override {
++        return VARS_TO_STR5(n_expert, n_shared, k, n_tokens, whole);
++    }
++
++    test_moe_route(int n_expert = 256, int n_shared = 2, int k = 6, int n_tokens = 1, bool whole = false)
++        : n_expert(n_expert), n_shared(n_shared), k(k), n_tokens(n_tokens), whole(whole) {}
++
++    bool run_whole_graph() override { return whole; }
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * logits = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_expert + n_shared, n_tokens);
++        ggml_set_name(logits, "logits");
++        ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_expert);
++        ggml_set_name(bias, "bias");
++        ggml_tensor * gscale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
++        ggml_set_name(gscale, "gscale");
++
++        ggml_tensor * ids = ggml_moe_route_ids(ctx, logits, bias, n_expert, k);
++        ggml_set_name(ids, "ids");
++        ggml_tensor * w = ggml_moe_route_weights(ctx, logits, ids, gscale, n_expert, 8.0f);
++        ggml_set_name(w, "weights");
++        return w;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            if (t->type == GGML_TYPE_F32) {
++                init_tensor_uniform(t, -4.0f, 4.0f);
++            }
++        }
++    }
++};
++
+ struct test_top_k : public test_case {
+     const ggml_type type;
+     const std::array<int64_t, 4> ne;
+@@ -10656,6 +10697,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+             }
+         }
+     }
++
++    for (int n_tokens : {1, 3, 64}) {
++        for (bool whole : {false, true}) {
++            test_cases.emplace_back(new test_moe_route(256, 2, 6, n_tokens, whole));
++        }
++    }
++    test_cases.emplace_back(new test_moe_route(128, 0, 8, 5));
+     for (int k : {4, 8, 16, 32}) {
+         for (int nrows : {1, 8, 16}) {
+             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {202048, nrows, 1, 1}, k));
+-- 
+2.55.0
+

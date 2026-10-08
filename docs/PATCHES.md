@@ -6,7 +6,7 @@
 2. **`patches/0000-pr25731-inkling-squashed.diff`**: [PR #25731](https://github.com/ggml-org/llama.cpp/pull/25731)
    (Inkling architecture support), squashed at its head `3870aa48b`. The PR was still open when this was measured.
    It is shipped as a diff so later force-pushes to the PR cannot change what you build.
-3. **`patches/0001…0015`**: `git am` patches made on this machine.
+3. **`patches/0001…0016`**: `git am` patches made on this machine.
 
 Every runtime switch these patches add is listed at the bottom of this page.
 
@@ -27,6 +27,7 @@ Every runtime switch these patches add is listed at the bottom of this page.
 | 0013 | **Tiled prompt kernel** for banded FA; optional `rel_idx` so wrapped sliding-window caches stay on the banded path | Prefill: pp512 @8K went 122 → ~180 tok/s. |
 | 0014 | `INKLING_PERF_PP` perf set in `test-backend-ops` | Isolated benchmarks of Inkling's prompt-batch matmul shapes. |
 | 0015 | **MTP depth heads and short-conv state rollback** | Loads the 8 MTP layers from the GGUF and builds the MTP graph. Recurrent short-conv state gets per-token snapshots (`n_rs_seq`), so a rejected speculative draft rolls back instead of replaying a checkpoint. This helps n-gram drafting too (code edit 70 → 78 tok/s). Also adds `tools/inkling-mtp-check`. |
+| 0016 | **Fused MoE routing op**, residual add folded into the short-conv fusion, fewer decode launches | New `GGML_OP_MOE_ROUTE` (CPU + HIP): top-k(sigmoid + bias) expert ids and the normalized weights of the 6 routed + 2 shared experts. It replaces ~14 ops per MoE layer and runs as one launch. The rel-position bias uses `out_prod` (no per-token transposed copy, bit-identical). The residual add after each short conv is folded into the fused kernel, and the shared-expert add chain fuses. Decode dispatches per token went 2192 → 1438: +6–8% decode. |
 
 ## Runtime switches added by the patches
 
@@ -39,5 +40,7 @@ Every runtime switch these patches add is listed at the bottom of this page.
 | `LLAMA_INKLING_PAD_KV` | unset | padded KV views + device-side length (enables HIP graph replay) |
 | `LLAMA_INKLING_NO_BANDED_IDX` | unset | wrapped sliding-window caches fall back to dense attention |
 | `GGML_CUDA_GRAPH_DEBUG` | unset | log HIP/CUDA graph capture decisions |
+| `LLAMA_INKLING_NO_MOE_ROUTE` | unset | build the original op-by-op MoE routing instead of `GGML_OP_MOE_ROUTE` |
+| `GGML_CUDA_DISABLE_SCONV_RESIDUAL_FUSION` | unset | keep the residual add out of the fused short conv |
 
 Pass them to the server with `EXTRA_ENV="-e NAME=value"`.

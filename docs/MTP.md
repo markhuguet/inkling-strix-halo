@@ -33,6 +33,13 @@ A higher-precision target would probably accept more drafts, but it does not fit
 
 Because depths ≥ 1 are almost never right, drafting more than one token is pointless here (`--spec-draft-n-max 1`).
 
+## Status (2026-10-08): not worth it
+
+After the decode fusions (patch 0016) and the Q5_K trunk, the default profile decodes at 20.7 tok/s and the MTP
+profile at 18.5. MTP also prefills more slowly and has a slower follow-up TTFT (see the README performance test).
+The faster each token gets, the less a 45%-accepted 1-token draft can win back, while every draft still costs a
+verify step that reads the union of both tokens' experts. The numbers below are from 2026-10-07.
+
 ## Why `PROFILE=mtp` runs n-gram first
 
 With one draft token, MTP can at most double decode speed. On copy-heavy output (code edits, quoting), n-gram drafting
