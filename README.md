@@ -103,6 +103,41 @@ How to read the verdicts:
 
 To run only some parts: `STEPS="bench server" PROFILES=default bench/run-all.sh`.
 
+## Performance test (2026-10-07)
+
+`make bench` was run a second time on the reference machine, from the repo's own build. That's a full independent
+rerun: AC power, `throughput-performance`, cool start. **All 33 metrics reproduced the reference**: every speed was
+within ±2%, except MTP-profile prefill at −6 to −8% (still inside the 10% tolerance). Greedy outputs were
+byte-identical.
+
+**Server** (`bench/server_suite.py`, temperature 0, 196K context):
+
+| | default profile (n-gram) | MTP profile (n-gram + MTP) |
+|---|---|---|
+| decode, 256 tokens | 17.6 tok/s | 17.8 tok/s (44% of drafts accepted) |
+| 400-token story | 17.4 tok/s | 17.7 tok/s (45% accepted) |
+| code edit, 1,373 tokens | 75.3 tok/s, output exactly correct | 74.8 tok/s, output exactly correct |
+| prefill, 2.4K-token prompt | 252 tok/s | 213 tok/s |
+| prefill, 9.8K-token prompt | 225 tok/s | 204 tok/s |
+| follow-up turn in a 9.8K conversation (TTFT) | 3.4 s | 3.7 s |
+
+**Engine** (llama-bench, 3 repetitions):
+
+| | short context | 1K | 8K | 16K |
+|---|---|---|---|---|
+| decode (tg64) | 20.4 tok/s | 17.0 | — | 14.8 |
+| prefill (pp512) | 273 tok/s | — | 187 | — |
+
+**Correctness:**
+
+- `test-backend-ops`, GPU vs CPU: 2,504 / 2,504 tests pass (FLASH_ATTN_EXT_BANDED, SSM_CONV, MUL_MAT, MUL_MAT_ID, GET_ROWS).
+- MTP head, teacher-forced agreement with the target's greedy token: depth 0 36%, depths 1-2 about 2%.
+
+**Takeaway:** the MTP profile gains only +1-2% on decode, and it makes prompt processing 10-15% slower. For
+long-prompt or agent work, the default profile is the better choice.
+
+Full results: [reference/rerun-2026-10-07/summary.md](reference/rerun-2026-10-07/summary.md).
+
 ## Repository layout
 
 ```
