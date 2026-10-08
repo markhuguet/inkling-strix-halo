@@ -1,0 +1,4 @@
+b9952e6eb8fb6ddfe4a2767da74c1d7759eed2bffa5052f556f57e915da9843e  UD-IQ3_XXS-trunk-q5_K-rf16-MTP/Inkling-Small-UD-IQ3_XXS-trunk-q5_K-rf16-MTP-00001-of-00004.gguf
+dc66f7badad146d04b35d5b1d4c6d1dc5bee2017ef20a29accbeb7339bef961d  UD-IQ3_XXS-trunk-q5_K-rf16-MTP/Inkling-Small-UD-IQ3_XXS-trunk-q5_K-rf16-MTP-00002-of-00004.gguf
+3ed5d9ec44209fc51a2bdd32412bd24656ec439177d9fed77d393184f2443386  UD-IQ3_XXS-trunk-q5_K-rf16-MTP/Inkling-Small-UD-IQ3_XXS-trunk-q5_K-rf16-MTP-00003-of-00004.gguf
+0133c4d70699fa8f5f0c36ee10f500f18d9d103ae0371d330fb8352a62bac6b8  UD-IQ3_XXS-trunk-q5_K-rf16-MTP/Inkling-Small-UD-IQ3_XXS-trunk-q5_K-rf16-MTP-00004-of-00004.gguf

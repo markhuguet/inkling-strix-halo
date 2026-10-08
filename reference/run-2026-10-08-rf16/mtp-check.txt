@@ -1,0 +1,3 @@
+depth 0: argmax == target greedy 0.358, == text 0.337  (1022 positions)
+depth 1: argmax == target greedy 0.023, == text 0.017  (1021 positions)
+depth 2: argmax == target greedy 0.026, == text 0.030  (1020 positions)

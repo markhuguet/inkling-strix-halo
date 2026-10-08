@@ -6,7 +6,7 @@
 2. **`patches/0000-pr25731-inkling-squashed.diff`**: [PR #25731](https://github.com/ggml-org/llama.cpp/pull/25731)
    (Inkling architecture support), squashed at its head `3870aa48b`. The PR was still open when this was measured.
    It is shipped as a diff so later force-pushes to the PR cannot change what you build.
-3. **`patches/0001…0016`**: `git am` patches made on this machine.
+3. **`patches/0001…0017`**: `git am` patches made on this machine.
 
 Every runtime switch these patches add is listed at the bottom of this page.
 
@@ -28,6 +28,7 @@ Every runtime switch these patches add is listed at the bottom of this page.
 | 0014 | `INKLING_PERF_PP` perf set in `test-backend-ops` | Isolated benchmarks of Inkling's prompt-batch matmul shapes. |
 | 0015 | **MTP depth heads and short-conv state rollback** | Loads the 8 MTP layers from the GGUF and builds the MTP graph. Recurrent short-conv state gets per-token snapshots (`n_rs_seq`), so a rejected speculative draft rolls back instead of replaying a checkpoint. This helps n-gram drafting too (code edit 70 → 78 tok/s). Also adds `tools/inkling-mtp-check`. |
 | 0016 | **Fused MoE routing op**, residual add folded into the short-conv fusion, fewer decode launches | New `GGML_OP_MOE_ROUTE` (CPU + HIP): top-k(sigmoid + bias) expert ids and the normalized weights of the 6 routed + 2 shared experts. It replaces ~14 ops per MoE layer and runs as one launch. The rel-position bias uses `out_prod` (no per-token transposed copy, bit-identical). The residual add after each short conv is folded into the fused kernel, and the shared-expert add chain fuses. Decode dispatches per token went 2192 → 1438: +6–8% decode. |
+| 0017 | `llama-quantize`: an explicit `--tensor-type` pattern may retype MoE router tensors | Routers (`ffn_gate_inp`) stay excluded from quantization unless a `--tensor-type` pattern names them. The trunk recipe uses this to store Inkling's F32 routers as F16. |
 
 ## Runtime switches added by the patches
 

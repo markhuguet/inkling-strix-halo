@@ -57,6 +57,17 @@ selects the others.
 (+7.7%) and 17.3 → 18.4 at 4K (+6.4%); server decode went 18.3 → 19.7. Decode output is bit-identical except for
 the routing math, whose KLD is unchanged (0.164 vs 0.168).
 
+**F16 routers (default since 2026-10-08, patch 0017).** `ffn_gate_inp` was stored as F16 instead of F32, halving
+the 161 MB router read per token. The router matvec went 1.41 → 0.97 ms per token; it is latency-bound at ~90 GB/s
+because 258 rows is too small a matrix. tg64 changed by +0.3% at 0 and +1.3% at 4K. KLD vs the f32 CPU reference was
+0.205 against 0.218 for F32 routers (noise), and the same top token was 86.6% against 86.5%.
+
+**Fusion round 2 (rejected).** Three more fusions were bit-identical: the K/V cache writes as one launch, the
+shared-expert adds folded into the expert reduction, and the layer close reordered so the residual fuses. Together
+they removed ~120 launches per token, but tg64 moved −0.7% at 0 and +0.3% at 4K, within noise. Fusing the q/k RMS
+norms as one kernel was not bit-identical. With ~1,000 launches per token left, they overlap with GPU work, and
+removing more no longer saves measurable time.
+
 **Matvec launch shape (rejected).** gfx1151 used the RDNA2 mmvq table, which gives 1 warp per block. A dedicated
 RDNA3.5 table was swept, and every setting landed within ±1%; 2–4 warps for the IQ types was worse. The remaining
 expert-kernel headroom is ~3%.

@@ -1,0 +1,40 @@
+From cbbe8e73b3b493d5ef5e7fce6d5f7956b666b56c Mon Sep 17 00:00:00 2001
+From: mark <30506876+markhuguet@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 16:50:46 -0400
+Subject: [PATCH] quantize: an explicit --tensor-type pattern may retype MoE
+ router tensors (ffn_gate_inp)
+
+Routers stay excluded from quantization by default; a --tensor-type override whose pattern names gate_inp now applies
+(used to store Inkling's F32 routers as F16: half the router bytes, KLD unchanged).
+---
+ src/llama-quant.cpp | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
+index d1a3092ba..72a3af7c2 100644
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -301,9 +301,18 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
+ 
+     quantize &= params->quantize_output_tensor || name != "output.weight";
+ 
+-    // do not quantize expert gating tensors
++    // do not quantize expert gating tensors, unless a --tensor-type pattern names them explicitly
+     // NOTE: can't use LLM_TN here because the layer number is not known
+-    quantize &= name.find("ffn_gate_inp.weight") == std::string::npos;
++    if (name.find("ffn_gate_inp.weight") != std::string::npos) {
++        bool named = false;
++        for (const auto * p = params->tt_overrides; p && p->pattern != nullptr; p++) {
++            if (std::strstr(p->pattern, "gate_inp") && std::regex_search(name, std::regex(p->pattern))) {
++                named = true;
++                break;
++            }
++        }
++        quantize &= named;
++    }
+ 
+     // do not quantize the i32 token-id -> expert-id routing table (DeepSeek-V4)
+     quantize &= name.find("ffn_gate_tid2eid.weight") == std::string::npos;
+-- 
+2.55.0
+

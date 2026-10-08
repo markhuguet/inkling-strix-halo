@@ -1,15 +1,18 @@
 #!/bin/bash
-# Build $MODELS/$BASE_QUANT-trunk-$TRUNK_TYPE from the downloaded GGUF: requantize only its Q6_K trunk tensors
-# (attention q/o/k/v, shared experts, dense FFN) to TRUNK_TYPE using an importance matrix computed from the downloaded
-# model itself; every other tensor is copied byte-identical. Steps (each skipped when its output exists):
+# Build $MODELS/$QUANT from the downloaded GGUF: requantize only its Q6_K trunk tensors (attention q/o/k/v, shared
+# experts, dense FFN) to TRUNK_TYPE using an importance matrix computed from the downloaded model itself, and store the
+# F32 MoE routers as ROUTER_TYPE; every other tensor is copied byte-identical. Steps (each skipped when its output exists):
 #   1. calibration text: wikitext-2 train (first 260 KB) + llama.cpp sources from the pinned tree
 #   2. imatrix: 160 x 512 tokens on the GPU (~12 min). Run with the op-by-op MoE routing (LLAMA_INKLING_NO_MOE_ROUTE=1),
 #      which is bit-identical to the build the pinned checksums were made with; the fused routing differs in the last bits
 #   3. llama-quantize with a per-tensor type file (tools/gen_types.py) (~1 min, writes ~91 GB)
 set -euo pipefail
 source "$(dirname "$0")/lib.sh"
-[ "$TRUNK_TYPE" != none ] || { log "TRUNK_TYPE=none: nothing to do"; exit 0; }
-DST="$BASE_QUANT-trunk-$TRUNK_TYPE"
+[ "$QUANT" != "$BASE_QUANT" ] || { log "TRUNK_TYPE=none ROUTER_TYPE=none: serving the download as-is"; exit 0; }
+DST="$QUANT"
+TT=$([ "$TRUNK_TYPE" = none ] && echo q6_K || echo "$TRUNK_TYPE")   # q6_K -> q6_K leaves the trunk untouched
+RT=$([ "$ROUTER_TYPE" = none ] && echo "" || echo "$ROUTER_TYPE")
+TYPES="types-$TT${RT:+-r$RT}.txt"
 Q="$WORK/trunk-quant"; mkdir -p "$Q"
 REF="$ROOT/reference/sha256-$DST.txt"
 if [ -f "$REF" ] && (cd "$MODELS" && sha256sum -c --quiet "$REF" 2>/dev/null); then log "$DST already built and verified"; exit 0; fi
@@ -39,15 +42,15 @@ if [ ! -f "$Q/imatrix.gguf" ]; then
   mv "$Q/imatrix.gguf.tmp" "$Q/imatrix.gguf"
 fi
 
-log "type file: pin all tensors, trunk Q6_K -> $TRUNK_TYPE"
+log "type file: pin all tensors, trunk Q6_K -> $TT, routers F32 -> ${RT:-f32}"
 in_container -v "$ROOT/tools":/tools:ro -v "$SRC":/src:ro -v "$MODELS":/models:ro -v "$Q":/q -e PYTHONPATH=/src/gguf-py -- \
-  python3 /tools/gen_types.py "/models/$BASE_QUANT" "/q/types-$TRUNK_TYPE.txt" "$TRUNK_TYPE"
+  python3 /tools/gen_types.py "/models/$BASE_QUANT" "/q/$TYPES" "$TT" - $RT
 
 log "llama-quantize -> $DST"
 mkdir -p "$MODELS/$DST"
 in_container -v "$MODELS":/models -v "$SRC":/src:ro -v "$Q":/q -- \
-  /src/"$BUILD"/bin/llama-quantize --allow-requantize --imatrix /q/imatrix.gguf --tensor-type-file "/q/types-$TRUNK_TYPE.txt" \
-  --keep-split "/models/$BASE_SHARD" "/models/$DST/Inkling-Small-$DST.gguf" Q4_K_M "$JOBS" > "$Q/quantize-$TRUNK_TYPE.log" 2>&1 \
-  || { tail -20 "$Q/quantize-$TRUNK_TYPE.log"; die "quantize failed"; }
-grep -E 'model size|quant size' "$Q/quantize-$TRUNK_TYPE.log" | sed 's/^/  /'
+  /src/"$BUILD"/bin/llama-quantize --allow-requantize --imatrix /q/imatrix.gguf --tensor-type-file "/q/$TYPES" \
+  --keep-split "/models/$BASE_SHARD" "/models/$DST/Inkling-Small-$DST.gguf" Q4_K_M "$JOBS" > "$Q/quantize-$DST.log" 2>&1 \
+  || { tail -20 "$Q/quantize-$DST.log"; die "quantize failed"; }
+grep -E 'model size|quant size' "$Q/quantize-$DST.log" | sed 's/^/  /'
 if [ -f "$REF" ]; then log "verifying sha256"; (cd "$MODELS" && sha256sum -c "$REF"); else log "no reference checksums at $REF"; fi
