@@ -35,6 +35,16 @@ inhibit() {
   fi
 }
 
+# re-run the calling script under systemd-inhibit (for scripts whose long steps are shell functions, which
+# systemd-inhibit cannot execute). Falls back to running uninhibited when systemd-inhibit does not work.
+#   inhibit_self "why" "$@"     (at the top of a script, after sourcing lib.sh)
+inhibit_self() {
+  local why=$1; shift
+  if [ -z "${INKLING_INHIBITED:-}" ] && command -v systemd-inhibit >/dev/null && systemd-inhibit --list >/dev/null 2>&1; then
+    INKLING_INHIBITED=1 exec systemd-inhibit --what=sleep:idle --who=inkling-strix-halo --why="$why" "$0" "$@"
+  fi
+}
+
 first_shard() {  # $1 = quant dir name
   local f
   f="$(cd "$MODELS" && ls "$1"/*00001-of-*.gguf 2>/dev/null | head -1)"
